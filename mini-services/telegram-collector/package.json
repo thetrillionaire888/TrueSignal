@@ -1,0 +1,14 @@
+{
+  "name": "telegram-collector",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun index.ts"
+  },
+  "dependencies": {
+    "backtest-kit": "^15.2.0",
+    "dukascopy-node": "^1.46.4",
+    "socket.io": "^4.7.5",
+    "teleproto": "^1.227.4"
+  }
+}

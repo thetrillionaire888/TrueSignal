@@ -1,0 +1,125 @@
+// Telegram Trading Signal Auditor & Analytics Platform
+// Prisma schema — SQLite
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A Telegram channel / group / supergroup under audit
+model Channel {
+  id              String   @id @default(cuid())
+  telegramId      String   @unique // e.g. "@crypto_vision_signals"
+  name            String
+  type            String   // channel | group | supergroup
+  category        String   // crypto | forex | stocks | commodities | index | mixed
+  description     String
+  subscriberCount Int
+  verified        Boolean  @default(false)
+  avatarColor     String   // tailwind gradient token for avatar
+  language        String   @default("en")
+  region          String   @default("global")
+  monitoredSince  DateTime @default(now())
+  lastMessageAt   DateTime?
+  status          String   @default("active") // active | paused | error
+  createdAt       DateTime @default(now())
+
+  messages Message[]
+  signals  Signal[]
+}
+
+// Raw archived Telegram message (ingested by collector service)
+model Message {
+  id                String   @id @default(cuid())
+  channelId         String
+  telegramMessageId Int      // sequential id within the channel
+  rawText           String
+  rawJson           String   @default("{}") // full serialized message (sender, timestamp, text, media, reactions…)
+  senderId          String?
+  senderName        String?
+  hasMedia          Boolean  @default(false)
+  mediaType         String?  // photo | video | document | sticker
+  views             Int      @default(0)
+  forwards          Int      @default(0)
+  reactions         Int      @default(0)
+  postedAt          DateTime
+  ingestedAt        DateTime @default(now())
+  parseStatus       String   @default("pending") // pending | parsed | no_signal | failed
+  ingestSource      String   @default("mtproto-tdlib")
+
+  channel Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  signals Signal[]
+}
+
+// A parsed trading signal extracted from a message
+model Signal {
+  id             String   @id @default(cuid())
+  messageId      String
+  channelId      String
+  instrument     String   // e.g. BTCUSDT, EURUSD, AAPL
+  instrumentType String   // crypto | forex | stock | commodity | index
+  action         String   // long | short
+  entryPrice     Float    // single price, or range midpoint for display
+  entryLow       Float?   // for range entries: lower bound
+  entryHigh      Float?   // for range entries: upper bound
+  isRange        Boolean  @default(false) // true if entry is a price range
+  stopLoss       Float
+  takeProfits    String   // JSON array string, e.g. "[64500, 65500, 67000]"
+  positionSize   String?  // e.g. "1% account"
+  leverage       String?  // e.g. "10x"
+  timeframe      String?  // e.g. 4h, swing, scalping
+  confidence     Float    @default(0) // parser confidence 0..1
+  parserVersion  String   @default("regex-nlp-v1.4")
+  parsedAt       DateTime @default(now())
+  status         String   @default("evaluating") // evaluating | closed | invalid
+  notes          String?
+  dedupHash      String   @default("") // composite hash: channelId+instrument+action+entry+SL+TPs — prevents duplicate signals
+
+  message     Message     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  channel     Channel     @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  evaluation  Evaluation?
+}
+
+// Outcome evaluation against market data
+model Evaluation {
+  id              String   @id @default(cuid())
+  signalId        String   @unique
+  outcome         String   // win | loss | breakeven | pending
+  exitPrice       Float?
+  exitReason      String?  // tp1 | tp2 | tp3 | sl | manual | time
+  hitTpLevel      Int?     // which TP was hit (1,2,3)
+  maxFavorablePct Float?   // best favorable excursion %
+  maxAdversePct   Float?   // worst adverse excursion %
+  rMultiple       Float    // realized R multiple (risk = |entry - SL|)
+  pnlPercent      Float    // realized PnL % of position
+  durationMinutes Int?
+  marketDataSource String  @default("aggregated-feed")
+  evaluatedAt     DateTime @default(now())
+
+  signal Signal @relation(fields: [signalId], references: [id], onDelete: Cascade)
+}
+
+// Cached historical OHLC bars from any data source (Dukascopy, Binance,
+// Yahoo Finance, CSV import, etc.). Avoids re-downloading the same price
+// data when evaluating multiple signals in the same time range.
+model PriceBar {
+  id            String   @id @default(cuid())
+  source        String   @default("dukascopy") // dukascopy | binance | yahoo | csv | darwinex
+  instrument    String   // instrument id, e.g. "xauusd", "btcusdt", "aapl"
+  timeframe     String   // "m15", "h1", "d1", etc.
+  timestamp     Int      // unix epoch millis (bar open time)
+  open          Float
+  high          Float
+  low           Float
+  close         Float
+  volume        Float    @default(0)
+  fetchedAt     DateTime @default(now())
+
+  @@unique([instrument, timeframe, timestamp, source])
+  @@index([instrument, timeframe, timestamp])
+  @@index([source])
+}
