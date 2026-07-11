@@ -105,10 +105,14 @@ export function DataManagerView() {
   return (
     <div className="space-y-5">
       <Tabs value={tab} onValueChange={setTab}>
-        <TabsList className="grid w-full grid-cols-4 max-w-lg">
+        <TabsList className="grid w-full grid-cols-5 max-w-2xl">
           <TabsTrigger value="fetch" className="gap-1.5">
             <CloudDownload className="h-3.5 w-3.5" />
             Fetch
+          </TabsTrigger>
+          <TabsTrigger value="import" className="gap-1.5">
+            <Upload className="h-3.5 w-3.5" />
+            Import
           </TabsTrigger>
           <TabsTrigger value="browse" className="gap-1.5">
             <Table2 className="h-3.5 w-3.5" />
@@ -126,6 +130,9 @@ export function DataManagerView() {
 
         <TabsContent value="fetch" className="mt-5">
           <FetchTab />
+        </TabsContent>
+        <TabsContent value="import" className="mt-5">
+          <ImportTab />
         </TabsContent>
         <TabsContent value="browse" className="mt-5">
           <BrowseTab />
@@ -401,6 +408,313 @@ function FetchTab() {
             </Button>
           </div>
         )}
+      </ChartCard>
+    </div>
+  )
+}
+
+// ── Import Tab (CSV upload — high-quality Dukascopy data) ────────────────────
+
+function ImportTab() {
+  const [instrument, setInstrument] = React.useState('xauusd')
+  const [source, setSource] = React.useState('dukascopy')
+  const [timeframe, setTimeframe] = React.useState('m1')
+  const [csvFile, setCsvFile] = React.useState<File | null>(null)
+  const [csvText, setCsvText] = React.useState('')
+  const [inputMode, setInputMode] = React.useState<'file' | 'paste'>('file')
+  const [result, setResult] = React.useState<{
+    instrument: string
+    source: string
+    timeframe: string
+    parsedBars: number
+    storedBars: number
+    inserted: number
+    skipped: number
+    aggregated: boolean
+    sourceTimeframe: string
+    aggregationNote?: string
+    dateRange: { from: string | null; to: string | null }
+    sampleRows: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
+  } | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const importMut = useMutation({
+    mutationFn: async () => {
+      let csvContent: string
+      if (inputMode === 'file') {
+        if (!csvFile) throw new Error('Please select a CSV file')
+        csvContent = await csvFile.text()
+      } else {
+        if (!csvText.trim()) throw new Error('Please paste CSV content')
+        csvContent = csvText
+      }
+      return collectorFetch<{
+        instrument: string
+        source: string
+        timeframe: string
+        parsedBars: number
+        storedBars: number
+        inserted: number
+        skipped: number
+        aggregated: boolean
+        sourceTimeframe: string
+        aggregationNote?: string
+        dateRange: { from: string | null; to: string | null }
+        sampleRows: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
+      }>('/api/import-csv', {
+        method: 'POST',
+        json: {
+          instrument,
+          source,
+          timeframe,
+          csvText: csvContent,
+          aggregate: 'auto',
+        },
+      })
+    },
+    onSuccess: (data) => {
+      setResult(data)
+      setError(null)
+    },
+    onError: (e) => {
+      setError(e instanceof Error ? e.message : String(e))
+      setResult(null)
+    },
+  })
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null
+    setCsvFile(file)
+    setResult(null)
+    setError(null)
+  }
+
+  return (
+    <div className="space-y-5">
+      <ChartCard
+        title="Import High-Quality CSV Data"
+        description="Upload OHLC bar data from StrategyQuant, Dukascopy, or any CSV export. Auto-detects format and timeframe."
+      >
+        <div className="space-y-4">
+          {/* Configuration */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <Label className="mb-1 block text-xs">Instrument</Label>
+              <Input
+                value={instrument}
+                onChange={(e) => setInstrument(e.target.value.toLowerCase().trim())}
+                placeholder="e.g. xauusd"
+                className="h-9"
+              />
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Stored in {instrument || 'instrument'}_{timeframe}.db
+              </p>
+            </div>
+            <div>
+              <Label className="mb-1 block text-xs">Source Label</Label>
+              <Select value={source} onValueChange={setSource}>
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="dukascopy">dukascopy</SelectItem>
+                  <SelectItem value="binance">binance</SelectItem>
+                  <SelectItem value="yahoo">yahoo</SelectItem>
+                  <SelectItem value="csv">csv</SelectItem>
+                  <SelectItem value="custom">custom</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Tags bars with this source name
+              </p>
+            </div>
+            <div>
+              <Label className="mb-1 block text-xs">Target Timeframe</Label>
+              <Select value={timeframe} onValueChange={setTimeframe}>
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIMEFRAMES.map((tf) => (
+                    <SelectItem key={tf.id} value={tf.id}>
+                      {tf.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                M1 = highest resolution (recommended)
+              </p>
+            </div>
+          </div>
+
+          {/* Input mode toggle */}
+          <div className="flex items-center gap-2">
+            <Button
+              variant={inputMode === 'file' ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => { setInputMode('file'); setResult(null); setError(null) }}
+              className="gap-1.5"
+            >
+              <Upload className="h-3.5 w-3.5" />
+              Upload File
+            </Button>
+            <Button
+              variant={inputMode === 'paste' ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => { setInputMode('paste'); setResult(null); setError(null) }}
+              className="gap-1.5"
+            >
+              <FileText className="h-3.5 w-3.5" />
+              Paste CSV
+            </Button>
+          </div>
+
+          {/* File upload or paste textarea */}
+          {inputMode === 'file' ? (
+            <div>
+              <Label className="mb-2 block text-xs">CSV File</Label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="file"
+                  accept=".csv,.txt,.tsv"
+                  onChange={handleFileChange}
+                  className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-medium file:text-primary-foreground hover:file:bg-primary/90"
+                />
+              </div>
+              {csvFile && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Selected: <span className="font-medium text-foreground">{csvFile.name}</span> ({(csvFile.size / 1024 / 1024).toFixed(2)} MB)
+                </p>
+              )}
+            </div>
+          ) : (
+            <div>
+              <Label className="mb-2 block text-xs">CSV Content</Label>
+              <Textarea
+                value={csvText}
+                onChange={(e) => { setCsvText(e.target.value); setResult(null); setError(null) }}
+                placeholder={`Date,Time,Open,High,Low,Close,Volume\n20240506,01:00:00,2304.655,2305.855,2303.055,2303.255,93470\n...`}
+                className="min-h-[200px] font-mono text-xs"
+              />
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                {csvText.length.toLocaleString()} chars · ~{csvText.split('\n').filter(l => l.trim()).length.toLocaleString()} lines
+              </p>
+            </div>
+          )}
+
+          {/* Supported formats hint */}
+          <div className="rounded-lg border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground">
+            <p className="mb-1 font-medium text-foreground">Supported CSV formats (auto-detected):</p>
+            <ul className="ml-4 list-disc space-y-0.5">
+              <li><code className="text-foreground">Date,Time,Open,High,Low,Close,Volume</code> — StrategyQuant / Dukascopy (YYYYMMDD HH:MM:SS)</li>
+              <li><code className="text-foreground">DateTime,Open,High,Low,Close,Volume</code> — ISO 8601 timestamps</li>
+              <li><code className="text-foreground">timestamp,open,high,low,close,volume</code> — Unix epoch (seconds or millis)</li>
+              <li><code className="text-foreground">DateTime,Bid,Ask,Volume</code> — Tick data (mid-price derived)</li>
+            </ul>
+            <p className="mt-2">
+              Timeframe is auto-detected from bar gaps. If the source doesn&apos;t match the target timeframe, bars are aggregated automatically.
+            </p>
+          </div>
+
+          {/* Import button */}
+          <div className="flex items-center gap-3">
+            <Button
+              onClick={() => importMut.mutate()}
+              disabled={importMut.isPending || (inputMode === 'file' ? !csvFile : !csvText.trim())}
+              className="gap-1.5"
+            >
+              {importMut.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Importing…
+                </>
+              ) : (
+                <>
+                  <Upload className="h-4 w-4" />
+                  Import CSV
+                </>
+              )}
+            </Button>
+            {(result || error) && (
+              <Button variant="ghost" size="sm" onClick={() => { setResult(null); setError(null) }}>
+                Clear
+              </Button>
+            )}
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-xs text-rose-600 dark:text-rose-400">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <span className="font-medium">Import failed:</span> {error}
+              </div>
+            </div>
+          )}
+
+          {/* Result */}
+          {result && (
+            <div className="space-y-3">
+              <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs text-emerald-700 dark:text-emerald-400">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                <div className="flex-1">
+                  <span className="font-medium">Import successful!</span>
+                  <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-0.5 sm:grid-cols-4">
+                    <span>Parsed: <span className="font-medium">{result.parsedBars.toLocaleString()}</span> bars</span>
+                    <span>Inserted: <span className="font-medium">{result.inserted.toLocaleString()}</span></span>
+                    <span>Skipped (existing): <span className="font-medium">{result.skipped.toLocaleString()}</span></span>
+                    <span>Source TF: <span className="font-medium">{result.sourceTimeframe}</span></span>
+                  </div>
+                  {result.aggregated && result.aggregationNote && (
+                    <div className="mt-1">
+                      <span className="font-medium">Aggregated:</span> {result.aggregationNote}
+                    </div>
+                  )}
+                  <div className="mt-1">
+                    Date range: <span className="font-medium">{result.dateRange.from}</span> → <span className="font-medium">{result.dateRange.to}</span>
+                  </div>
+                  <div className="mt-1">
+                    Stored in: <code className="rounded bg-emerald-500/10 px-1 py-0.5">{result.instrument}_{result.timeframe}.db</code> (source: <code className="rounded bg-emerald-500/10 px-1 py-0.5">{result.source}</code>)
+                  </div>
+                </div>
+              </div>
+
+              {/* Sample rows */}
+              {result.sampleRows.length > 0 && (
+                <div>
+                  <p className="mb-1 text-xs font-medium text-muted-foreground">Sample rows (first 3):</p>
+                  <div className="overflow-x-auto rounded-lg border border-border/50">
+                    <table className="w-full text-xs">
+                      <thead className="bg-muted/30 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                        <tr>
+                          <th className="px-2 py-1.5 font-medium">Timestamp</th>
+                          <th className="px-2 py-1.5 text-right font-medium">Open</th>
+                          <th className="px-2 py-1.5 text-right font-medium">High</th>
+                          <th className="px-2 py-1.5 text-right font-medium">Low</th>
+                          <th className="px-2 py-1.5 text-right font-medium">Close</th>
+                          <th className="px-2 py-1.5 text-right font-medium">Volume</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.sampleRows.map((r, i) => (
+                          <tr key={i} className="border-t border-border/30">
+                            <td className="px-2 py-1.5 font-mono text-[10px] text-muted-foreground">{r.datetime}</td>
+                            <td className="px-2 py-1.5 text-right tnum">{r.open}</td>
+                            <td className="px-2 py-1.5 text-right tnum">{r.high}</td>
+                            <td className="px-2 py-1.5 text-right tnum">{r.low}</td>
+                            <td className="px-2 py-1.5 text-right tnum">{r.close}</td>
+                            <td className="px-2 py-1.5 text-right tnum text-muted-foreground">{r.volume.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </ChartCard>
     </div>
   )

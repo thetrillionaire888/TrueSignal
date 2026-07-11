@@ -11,7 +11,8 @@ import * as tg from "./telegram";
 import { parseSignal } from "./parser";
 import { evaluateSignals, getEvalStats, type EvalProgress } from "./evaluator";
 import { importFromSource } from "./importers";
-import { getCacheSummary } from "./bar-cache";
+import { getCacheSummary, importBars, type Bar } from "./bar-cache";
+import { parseCsvFlexible, aggregateBars, detectTimeframe } from "./csv-parser";
 import {
   startJob,
   updateProgress,
@@ -219,11 +220,23 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
         const signalTime = parseDbDate(signal.postedAt);
         const { bars, stats } = await fetchBars(dukascopyInstrument, signalTime, 48, undefined, true);
 
+        // Derive the marketDataSource label from the fetch stats
+        const sourceLabel = stats.source
+          ? stats.source.toLowerCase().split(" ")[0]
+          : "dukascopy";
+        let timeframe = "m15";
+        if (bars.length >= 2) {
+          const gap = bars[1].timestamp - bars[0].timestamp;
+          if (gap === 60000) timeframe = "m1";
+          else if (gap === 900000) timeframe = "m15";
+        }
+        const marketDataSource = `${sourceLabel}-${timeframe}`;
+
         // Delete old evaluation
         sqlite.prepare("DELETE FROM Evaluation WHERE signalId = ?").run(signalId);
 
         // Re-evaluate
-        const result = evaluateSignal(signal, bars);
+        const result = evaluateSignal(signal, bars, marketDataSource);
         saveEvaluation(result);
 
         return json(res, 200, {
@@ -327,6 +340,108 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       const channelId = url.searchParams.get("channelId") ?? undefined;
       const stats = getEvalStats(channelId);
       return json(res, 200, stats);
+    }
+
+    // ── Import CSV (flexible format, high-quality Dukascopy data) ───────────
+    // Accepts CSV text in multiple formats:
+    //   - StrategyQuant: Date,Time,Open,High,Low,Close,Volume (YYYYMMDD HH:MM:SS)
+    //   - Combined:      DateTime,Open,High,Low,Close,Volume (ISO 8601)
+    //   - Unix:          timestamp,open,high,low,close,volume (epoch)
+    //   - Bid/Ask:       DateTime,Bid,Ask,Volume (mid-price derived)
+    //
+    // Body: { instrument, source, timeframe, csvText, aggregate? }
+    //   - instrument: e.g. "xauusd"
+    //   - source: e.g. "dukascopy" (stored in PriceBar.source)
+    //   - timeframe: target timeframe for storage (e.g. "m1" or "m15")
+    //   - csvText: the CSV content as a string
+    //   - aggregate: optional, "auto" | true | false
+    //     - "auto": detect source timeframe from bar gaps, aggregate if needed
+    //     - true: always aggregate to target timeframe
+    //     - false: store as-is (timestamps must already match target timeframe)
+    //     - default: "auto"
+    if (path === "/api/import-csv" && req.method === "POST") {
+      const instrument = String(body.instrument ?? "").trim().toLowerCase();
+      const source = String(body.source ?? "dukascopy").toLowerCase();
+      const timeframe = String(body.timeframe ?? "m1").toLowerCase();
+      const csvText = body.csvText as string | undefined;
+      const aggregateMode = body.aggregate ?? "auto"; // "auto" | true | false
+
+      if (!instrument) {
+        return json(res, 400, { error: "instrument is required" });
+      }
+      if (!csvText || csvText.trim().length === 0) {
+        return json(res, 400, { error: "csvText is required (non-empty)" });
+      }
+
+      try {
+        // Parse the CSV (auto-detects format)
+        const parsedBars = parseCsvFlexible(csvText);
+        if (parsedBars.length === 0) {
+          return json(res, 400, { error: "No valid bars found in CSV. Check the format." });
+        }
+
+        // Detect the source timeframe from bar gaps
+        const detectedTf = detectTimeframe(parsedBars);
+        const sourceTimeframe = detectedTf ?? "m1";
+
+        // Decide whether to aggregate
+        let barsToStore: Bar[] = parsedBars;
+        let aggregated = false;
+        let aggregationNote: string | undefined;
+
+        if (aggregateMode === "auto") {
+          if (sourceTimeframe !== timeframe) {
+            try {
+              barsToStore = aggregateBars(parsedBars, sourceTimeframe, timeframe);
+              aggregated = true;
+              aggregationNote = `aggregated ${sourceTimeframe} → ${timeframe}`;
+            } catch (e) {
+              // If aggregation fails (e.g., unknown timeframe), store as-is
+              aggregationNote = `aggregation skipped: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          }
+        } else if (aggregateMode === true || aggregateMode === "true") {
+          try {
+            barsToStore = aggregateBars(parsedBars, sourceTimeframe, timeframe);
+            aggregated = true;
+            aggregationNote = `aggregated ${sourceTimeframe} → ${timeframe}`;
+          } catch (e) {
+            return json(res, 400, { error: `Aggregation failed: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        }
+        // else aggregateMode === false: store as-is
+
+        // Insert into the per-asset DB
+        const { inserted, skipped } = importBars(source, instrument, timeframe, barsToStore);
+
+        return json(res, 200, {
+          instrument,
+          source,
+          timeframe,
+          parsedBars: parsedBars.length,
+          storedBars: barsToStore.length,
+          inserted,
+          skipped,
+          aggregated,
+          sourceTimeframe,
+          aggregationNote,
+          dateRange: {
+            from: barsToStore.length > 0 ? new Date(barsToStore[0].timestamp).toISOString() : null,
+            to: barsToStore.length > 0 ? new Date(barsToStore[barsToStore.length - 1].timestamp).toISOString() : null,
+          },
+          sampleRows: barsToStore.slice(0, 3).map((b) => ({
+            timestamp: b.timestamp,
+            datetime: new Date(b.timestamp).toISOString(),
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume,
+          })),
+        });
+      } catch (e) {
+        return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      }
     }
 
     // ── Import price data from various sources ──────────────────────────────

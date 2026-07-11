@@ -126,6 +126,7 @@ type EvalResult = {
   barsAnalyzed: number;
   instrument: string;
   dukascopyInstrument: string;
+  marketDataSource: string; // e.g. "dukascopy-m1", "binance-m15", "yahoo-m15"
 };
 
 // ── Prepared statements ──────────────────────────────────────────────────────
@@ -179,6 +180,16 @@ const stmts = {
 // ── Fetch historical bars (with DB caching) ──────────────────────────────────
 // Uses the read-through cache in bar-cache.ts: checks SQLite first, only
 // fetches missing bars from Dukascopy, and stores them for future reuse.
+//
+// Timeframe strategy (M1-first with M15 fallback):
+//   1. Try M1 first — highest resolution, best for precise entry/exit detection.
+//      Used when high-quality M1 data has been imported (e.g. Dukascopy CSV).
+//   2. Fall back to M15 if M1 has no bars — preserves backward compatibility
+//      with the existing m15 cache populated by API fetches.
+//
+// The 48h evaluation window contains:
+//   - M1:  ~2880 bars (one per minute)  — precise but ~15× more data
+//   - M15: ~192 bars (one per 15 min)   — coarser but faster
 export async function fetchBars(
   instrument: string,
   fromTime: Date,
@@ -187,6 +198,15 @@ export async function fetchBars(
   forceRefresh: boolean = false
 ): Promise<{ bars: Bar[]; stats: CacheStats }> {
   const toTime = new Date(fromTime.getTime() + hoursForward * 3600000);
+
+  // Try M1 first (preferred — higher resolution)
+  const m1Result = await fetchBarsCached(instrument, "m1", fromTime, toTime, onProgress, forceRefresh);
+  if (m1Result.bars.length > 0) {
+    return m1Result;
+  }
+
+  // Fall back to M15 (existing cache from API fetches)
+  onProgress?.(`no M1 bars for ${instrument}, falling back to m15`);
   return fetchBarsCached(instrument, "m15", fromTime, toTime, onProgress, forceRefresh);
 }
 
@@ -198,7 +218,7 @@ export async function fetchBars(
 //   - stop:    buy when bar.high ≥ entry; sell when bar.low ≤ entry
 //   - range:   walk forward to first range-touch; conservative fill at edge
 //              closest to SL (worst-case R)
-export function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
+export function evaluateSignal(signal: SignalRow, bars: Bar[], marketDataSource: string = "dukascopy-m15"): EvalResult {
   const tps = JSON.parse(signal.takeProfits) as number[];
   const tp = tps.length > 0 ? tps[0] : null; // evaluate against first TP
   const sl = signal.stopLoss;
@@ -213,6 +233,7 @@ export function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
     dukascopyInstrument: toDukascopyInstrument(signal.instrument) ?? signal.instrument,
     evaluatedAt: now,
     barsAnalyzed: bars.length,
+    marketDataSource,
   };
 
   if (!tp) {
@@ -470,7 +491,7 @@ export function saveEvaluation(result: EvalResult) {
     $rMultiple: result.rMultiple,
     $pnlPercent: result.pnlPercent,
     $durationMinutes: result.durationMinutes,
-    $marketDataSource: "dukascopy-m15",
+    $marketDataSource: result.marketDataSource,
     $evaluatedAt: result.evaluatedAt,
   });
 }
@@ -496,7 +517,7 @@ function saveEvaluationBatch(batch: EvalResult[]) {
         $rMultiple: result.rMultiple,
         $pnlPercent: result.pnlPercent,
         $durationMinutes: result.durationMinutes,
-        $marketDataSource: "dukascopy-m15",
+        $marketDataSource: result.marketDataSource,
         $evaluatedAt: result.evaluatedAt,
       });
     }
@@ -583,7 +604,7 @@ async function preFetchBarsByInstrument(
   signals: SignalRow[],
   onProgress: (p: EvalProgress) => void,
   jobId: string
-): Promise<{ barCache: Map<string, Bar[]>; instrumentsFetched: number; barsCached: number; barsFetched: number }> {
+): Promise<{ barCache: Map<string, Bar[]>; sourceMap: Map<string, string>; instrumentsFetched: number; barsCached: number; barsFetched: number }> {
   // Group signals by Dukascopy instrument
   const instrumentGroups = new Map<string, { signals: SignalRow[]; minTime: Date; maxTime: Date }>();
 
@@ -605,6 +626,7 @@ async function preFetchBarsByInstrument(
 
   // Fetch bars for each instrument (parallel, up to 4 at a time)
   const barCache = new Map<string, Bar[]>();
+  const sourceMap = new Map<string, string>(); // cacheKey → source label (e.g. "dukascopy-m1")
   let instrumentsFetched = 0;
   let barsCached = 0;
   let barsFetched = 0;
@@ -637,6 +659,21 @@ async function preFetchBarsByInstrument(
       barsCached += stats.cached;
       barsFetched += stats.fetched;
 
+      // Derive the source label from stats.source (e.g. "Binance REST" → "binance")
+      // and the timeframe (m1 or m15, inferred from bar interval if available).
+      // Default to "dukascopy-m15" for backward compatibility.
+      const sourceLabel = stats.source
+        ? stats.source.toLowerCase().split(" ")[0] // "Binance REST" → "binance"
+        : "dukascopy";
+      // Detect timeframe from bar gaps if we have bars
+      let timeframe = "m15";
+      if (bars.length >= 2) {
+        const gap = bars[1].timestamp - bars[0].timestamp;
+        if (gap === 60000) timeframe = "m1";
+        else if (gap === 900000) timeframe = "m15";
+      }
+      const marketDataSource = `${sourceLabel}-${timeframe}`;
+
       // Cache bars per signal by finding the 48h window starting at each signal's postedAt
       for (const signal of group.signals) {
         const signalTime = parseDbDate(signal.postedAt);
@@ -645,12 +682,13 @@ async function preFetchBarsByInstrument(
         const signalBars = bars.filter(b => b.timestamp >= signalTime.getTime() && b.timestamp < signalEndMs);
         const cacheKey = `${signal.instrument}|${signal.postedAt}`;
         barCache.set(cacheKey, signalBars);
+        sourceMap.set(cacheKey, marketDataSource);
       }
 
       onProgress({
         jobId,
         phase: "fetching",
-        message: `Pre-fetched ${instrument.toUpperCase()}: ${bars.length} bars (${stats.cached} cached / ${stats.fetched} fetched) for ${group.signals.length} signals`,
+        message: `Pre-fetched ${instrument.toUpperCase()}: ${bars.length} bars (${stats.cached} cached / ${stats.fetched} fetched, source=${marketDataSource}) for ${group.signals.length} signals`,
         current: 0,
         total: signals.length,
         instrument,
@@ -658,7 +696,7 @@ async function preFetchBarsByInstrument(
     }));
   }
 
-  return { barCache, instrumentsFetched, barsCached, barsFetched };
+  return { barCache, sourceMap, instrumentsFetched, barsCached, barsFetched };
 }
 
 /**
@@ -670,6 +708,7 @@ async function runWorker(
   workerId: number,
   workerSignals: SignalRow[],
   barCache: Map<string, Bar[]>,
+  sourceMap: Map<string, string>,
   onProgress: (p: EvalProgress) => void,
   jobId: string,
   totalSignals: number,
@@ -689,6 +728,7 @@ async function runWorker(
         hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0,
         durationMinutes: null, evaluatedAt: new Date().toISOString(), barsAnalyzed: 0,
         instrument: signal.instrument, dukascopyInstrument: "n/a",
+        marketDataSource: "n/a",
       };
       pending.push(result);
       results.push(result);
@@ -708,7 +748,7 @@ async function runWorker(
       });
     }
 
-    const result = evaluateSignal(signal, bars);
+    const result = evaluateSignal(signal, bars, sourceMap.get(cacheKey) ?? "dukascopy-m15");
     pending.push(result);
     results.push(result);
 
@@ -753,7 +793,7 @@ export async function evaluateSignals(
   // Groups all signals by Dukascopy instrument, fetches the full date range
   // once per instrument (instead of once per signal). Reduces API calls from
   // N (per-signal) to M (per-instrument) — typically a 10-20× reduction.
-  const { barCache, instrumentsFetched, barsCached, barsFetched } = await preFetchBarsByInstrument(signals, onProgress, jobId);
+  const { barCache, sourceMap, instrumentsFetched, barsCached, barsFetched } = await preFetchBarsByInstrument(signals, onProgress, jobId);
 
   onProgress({
     jobId,
@@ -773,7 +813,7 @@ export async function evaluateSignals(
   const progressCounter = { current: 0 };
   const workerResults = await Promise.all(
     workerQueues.map((queue, i) =>
-      runWorker(i, queue, barCache, onProgress, jobId, signals.length, progressCounter)
+      runWorker(i, queue, barCache, sourceMap, onProgress, jobId, signals.length, progressCounter)
     )
   );
 

@@ -29,11 +29,22 @@ import { join } from "node:path";
 
 const DEFAULT_FILE = "/home/z/my-project/upload/2026.7.12XAUUSD_M1_dukas-M1-No Session.csv";
 const INSTRUMENT = "xauusd";
-const TIMEFRAME = "m15";
 const SOURCE = "dukascopy";
 
-// 15 minutes in milliseconds
-const M15_MS = 15 * 60 * 1000;
+// Timeframe can be overridden via CLI arg: bun scripts/import-xauusd-csv.ts [file] [timeframe]
+// Defaults to m1 (highest resolution — recommended for the evaluator).
+// Use m15 to aggregate M1 data into M15 bars (legacy behavior).
+const TIMEFRAME = process.argv[3] || "m1";
+
+// Bar interval in milliseconds (used for aggregation bucketing)
+const BAR_INTERVAL_MS: Record<string, number> = {
+  m1: 60_000,
+  m5: 300_000,
+  m15: 900_000,
+  m30: 1_800_000,
+  h1: 3_600_000,
+};
+const TARGET_INTERVAL_MS = BAR_INTERVAL_MS[TIMEFRAME] ?? 60_000;
 
 // Get the per-asset DB connection for this instrument+timeframe
 const marketDb = getMarketDbSync(INSTRUMENT, TIMEFRAME);
@@ -53,7 +64,7 @@ type M1Bar = {
   volume: number;
 };
 
-type M15Bar = {
+type AggregatedBar = {
   timestamp: number;
   open: number;
   high: number;
@@ -103,21 +114,27 @@ function parseRow(line: string): M1Bar | null {
 }
 
 /**
- * Aggregate M1 bars into M15 bars.
- * Groups by 15-minute bucket: timestamp → floor(timestamp / M15_MS) * M15_MS
+ * Aggregate M1 bars into the target timeframe.
+ * Groups by bucket: timestamp → floor(timestamp / TARGET_INTERVAL_MS) * TARGET_INTERVAL_MS
+ * If target timeframe is m1, no aggregation is performed (bars are returned as-is).
  */
-function aggregateM1toM15(m1Bars: M1Bar[]): M15Bar[] {
+function aggregateM1(m1Bars: M1Bar[], targetIntervalMs: number): AggregatedBar[] {
+  // If target is m1, skip aggregation — just convert type
+  if (targetIntervalMs === 60_000) {
+    return m1Bars.map(b => ({ ...b }));
+  }
+
   const buckets = new Map<number, M1Bar[]>();
 
   for (const bar of m1Bars) {
-    const bucketTs = Math.floor(bar.timestamp / M15_MS) * M15_MS;
+    const bucketTs = Math.floor(bar.timestamp / targetIntervalMs) * targetIntervalMs;
     if (!buckets.has(bucketTs)) {
       buckets.set(bucketTs, []);
     }
     buckets.get(bucketTs)!.push(bar);
   }
 
-  const m15Bars: M15Bar[] = [];
+  const aggregatedBars: AggregatedBar[] = [];
   for (const [bucketTs, bars] of buckets) {
     // Sort by timestamp within bucket (should already be sorted, but just in case)
     bars.sort((a, b) => a.timestamp - b.timestamp);
@@ -128,12 +145,12 @@ function aggregateM1toM15(m1Bars: M1Bar[]): M15Bar[] {
     const close = bars[bars.length - 1].close;
     const volume = bars.reduce((sum, b) => sum + b.volume, 0);
 
-    m15Bars.push({ timestamp: bucketTs, open, high, low, close, volume });
+    aggregatedBars.push({ timestamp: bucketTs, open, high, low, close, volume });
   }
 
   // Sort by timestamp
-  m15Bars.sort((a, b) => a.timestamp - b.timestamp);
-  return m15Bars;
+  aggregatedBars.sort((a, b) => a.timestamp - b.timestamp);
+  return aggregatedBars;
 }
 
 async function main() {
@@ -182,9 +199,9 @@ async function main() {
 
   // Aggregate M1 → M15
   console.log("Aggregating M1 → M15…");
-  const m15Bars = aggregateM1toM15(m1Bars);
-  console.log(`M15 bars: ${m15Bars.length}`);
-  console.log(`M15 date range: ${new Date(m15Bars[0].timestamp).toISOString()} → ${new Date(m15Bars[m15Bars.length - 1].timestamp).toISOString()}`);
+  const aggregatedBars = aggregateM1(m1Bars, TARGET_INTERVAL_MS);
+  console.log(`${TIMEFRAME} bars: ${aggregatedBars.length}`);
+  console.log(`${TIMEFRAME} date range: ${new Date(aggregatedBars[0].timestamp).toISOString()} → ${new Date(aggregatedBars[aggregatedBars.length - 1].timestamp).toISOString()}`);
   console.log();
 
   // Check what's currently in the DB
@@ -202,8 +219,8 @@ async function main() {
 
   const startTime = Date.now();
 
-  for (let i = 0; i < m15Bars.length; i += BATCH_SIZE) {
-    const batch = m15Bars.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < aggregatedBars.length; i += BATCH_SIZE) {
+    const batch = aggregatedBars.slice(i, i + BATCH_SIZE);
 
     const tx = marketDb.transaction(() => {
       for (const bar of batch) {
@@ -225,9 +242,9 @@ async function main() {
     tx();
 
     totalProcessed += batch.length;
-    if (totalProcessed % 5000 === 0 || totalProcessed === m15Bars.length) {
+    if (totalProcessed % 5000 === 0 || totalProcessed === aggregatedBars.length) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`  ${totalProcessed}/${m15Bars.length} processed (${inserted} inserted, ${ignored} ignored) — ${elapsed}s`);
+      console.log(`  ${totalProcessed}/${aggregatedBars.length} processed (${inserted} inserted, ${ignored} ignored) — ${elapsed}s`);
     }
   }
 
