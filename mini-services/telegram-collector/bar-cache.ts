@@ -179,7 +179,7 @@ export async function fetchBarsCached(
                       .includes(binanceSymbol);
     if (isCrypto) {
       onProgress?.(`Dukascopy failed — trying Binance fallback for ${binanceSymbol}…`);
-      // Retry Binance up to 3 times (handles TLS errors, rate limiting, transient network issues)
+      // Retry Binance REST API up to 3 times (handles TLS errors, rate limiting, transient network issues)
       for (let binanceAttempt = 0; binanceAttempt < 3; binanceAttempt++) {
         try {
           const binanceInterval: Record<string, string> = {
@@ -209,7 +209,7 @@ export async function fetchBarsCached(
               parseFloat(row[4] as string),
               parseFloat(row[5] as string),
             ]);
-            onProgress?.(`Binance fallback: ${fetched.length} bars for ${binanceSymbol}`);
+            onProgress?.(`Binance REST: ${fetched.length} bars for ${binanceSymbol}`);
             break; // success — stop retrying
           } else {
             const body = await binanceRes.text();
@@ -217,11 +217,81 @@ export async function fetchBarsCached(
           }
         } catch (e2) {
           const msg = e2 instanceof Error ? e2.message : String(e2);
-          console.warn(`[bar-cache] Binance attempt ${binanceAttempt + 1}/3 failed: ${msg}`);
+          console.warn(`[bar-cache] Binance REST attempt ${binanceAttempt + 1}/3 failed: ${msg}`);
           if (binanceAttempt < 2) {
             const delay = 1000 * Math.pow(2, binanceAttempt); // 1s, 2s
             await new Promise((r) => setTimeout(r, delay));
           }
+        }
+      }
+
+      // ── Last resort: Binance Vision data archive ─────────────────────────
+      // If REST API failed (TLS, rate limit, etc.), try the public data archive.
+      // https://data.binance.vision/data/spot/daily/klines/{SYMBOL}/{INTERVAL}/{SYMBOL}-{INTERVAL}-{DATE}.zip
+      // Files are ZIP containing CSV with microsecond timestamps (÷1000 for ms).
+      // No auth, no rate limit, no TLS issues (served via CloudFront/S3).
+      if (fetched.length === 0) {
+        onProgress?.(`Binance REST failed — trying Binance Vision archive…`);
+        const binanceInterval: Record<string, string> = {
+          m1: "1m", m5: "5m", m15: "15m", m30: "30m", h1: "1h", h4: "4h", d1: "1d",
+        };
+        const bi = binanceInterval[timeframe] ?? "15m";
+
+        // Iterate each day in the range and download daily ZIP files
+        const dayStart = new Date(fromMs);
+        dayStart.setUTCHours(0, 0, 0, 0);
+        const dayEnd = new Date(toMs);
+        const visionBars: unknown[][] = [];
+
+        for (let d = new Date(dayStart); d <= dayEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+          const dateStr = d.toISOString().slice(0, 10); // YYYY-MM-DD
+          const visionUrl = `https://data.binance.vision/data/spot/daily/klines/${binanceSymbol}/${bi}/${binanceSymbol}-${bi}-${dateStr}.zip`;
+
+          try {
+            const visionFetchPromise = fetch(visionUrl);
+            const visionTimeoutPromise = new Promise<Response>((_, reject) =>
+              setTimeout(() => reject(new Error("Vision fetch timed out after 10s")), 10000)
+            );
+            const visionRes = await Promise.race([visionFetchPromise, visionTimeoutPromise]);
+
+            if (!visionRes.ok) continue; // skip missing days (weekends, future dates)
+
+            // Download ZIP and extract CSV
+            const zipBuf = await visionRes.arrayBuffer();
+            const { writeFileSync, readFileSync, unlinkSync } = await import("node:fs");
+            const { execSync } = await import("node:child_process");
+            const tmpZip = `/tmp/binance-${binanceSymbol}-${bi}-${dateStr}.zip`;
+            const tmpCsv = `/tmp/${binanceSymbol}-${bi}-${dateStr}.csv`;
+            writeFileSync(tmpZip, new Uint8Array(zipBuf));
+            try {
+              execSync(`cd /tmp && unzip -o "${tmpZip}" 2>/dev/null`);
+              const csv = readFileSync(tmpCsv, "utf-8");
+              const lines = csv.trim().split("\n");
+              for (const line of lines) {
+                const cols = line.split(",");
+                visionBars.push([
+                  Math.floor(Number(cols[0]) / 1000), // microseconds → milliseconds
+                  parseFloat(cols[1]),
+                  parseFloat(cols[2]),
+                  parseFloat(cols[3]),
+                  parseFloat(cols[4]),
+                  parseFloat(cols[5]),
+                ]);
+              }
+              unlinkSync(tmpCsv);
+            } catch {
+              // unzip might not be available on all systems
+            }
+            unlinkSync(tmpZip);
+          } catch {
+            // skip this day on any error
+          }
+        }
+
+        if (visionBars.length > 0) {
+          // Filter to the requested time range
+          fetched = visionBars.filter((b) => Number(b[0]) >= fromMs && Number(b[0]) < toMs);
+          onProgress?.(`Binance Vision: ${fetched.length} bars for ${binanceSymbol}`);
         }
       }
     }
