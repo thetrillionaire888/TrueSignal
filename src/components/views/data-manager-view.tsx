@@ -31,6 +31,8 @@ import {
   Table2,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
 } from 'lucide-react'
 
 type CacheSummary = {
@@ -540,12 +542,18 @@ function BrowseTab() {
         </span>
         {data && data.totalPages > 1 && (
           <div className="flex items-center gap-1.5">
-            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)} className="h-7 w-7 p-0">
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(1)} className="h-7 w-7 p-0" title="First page">
+              <ChevronsLeft className="h-4 w-4" />
+            </Button>
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)} className="h-7 w-7 p-0" title="Previous page">
               <ChevronLeft className="h-4 w-4" />
             </Button>
             <span className="tnum">{page} / {data.totalPages}</span>
-            <Button variant="outline" size="sm" disabled={page >= data.totalPages} onClick={() => setPage(page + 1)} className="h-7 w-7 p-0">
+            <Button variant="outline" size="sm" disabled={page >= data.totalPages} onClick={() => setPage(page + 1)} className="h-7 w-7 p-0" title="Next page">
               <ChevronRight className="h-4 w-4" />
+            </Button>
+            <Button variant="outline" size="sm" disabled={page >= data.totalPages} onClick={() => setPage(data.totalPages)} className="h-7 w-7 p-0" title="Last page">
+              <ChevronsRight className="h-4 w-4" />
             </Button>
           </div>
         )}

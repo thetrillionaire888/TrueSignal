@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { fmtPrice, fmtDate, parseTPs, fmtCompact, CATEGORY_META } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
+import { Search, SlidersHorizontal, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, X, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
 
 type SignalRow = {
   id: string
@@ -390,8 +390,19 @@ export function SignalsView() {
               variant="outline"
               size="sm"
               disabled={!data || data.page <= 1}
+              onClick={() => setFilter('page', 1)}
+              className="h-7 w-7 p-0"
+              title="First page"
+            >
+              <ChevronsLeft className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!data || data.page <= 1}
               onClick={() => setFilter('page', (useUI.getState().filters.page) - 1)}
               className="h-7 w-7 p-0"
+              title="Previous page"
             >
               <ChevronLeft className="h-4 w-4" />
             </Button>
@@ -404,8 +415,19 @@ export function SignalsView() {
               disabled={!data || data.page >= (data?.totalPages ?? 1)}
               onClick={() => setFilter('page', (useUI.getState().filters.page) + 1)}
               className="h-7 w-7 p-0"
+              title="Next page"
             >
               <ChevronRight className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!data || data.page >= (data?.totalPages ?? 1)}
+              onClick={() => setFilter('page', data?.totalPages ?? 1)}
+              className="h-7 w-7 p-0"
+              title="Last page"
+            >
+              <ChevronsRight className="h-4 w-4" />
             </Button>
           </div>
         </div>

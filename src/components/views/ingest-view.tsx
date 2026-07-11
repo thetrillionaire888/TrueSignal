@@ -36,6 +36,8 @@ import {
   ArrowRight,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Target,
   Play,
   Pause,
@@ -748,6 +750,16 @@ function IngestionPanel({
                     variant="outline"
                     size="sm"
                     disabled={recentQuery.data.page <= 1}
+                    onClick={() => setMsgPage(1)}
+                    className="h-7 w-7 p-0"
+                    title="First page"
+                  >
+                    <ChevronsLeft className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={recentQuery.data.page <= 1}
                     onClick={() => setMsgPage((p) => Math.max(1, p - 1))}
                     className="h-7 gap-1"
                   >
@@ -766,6 +778,16 @@ function IngestionPanel({
                   >
                     Next
                     <ChevronRight className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={recentQuery.data.page >= recentQuery.data.totalPages}
+                    onClick={() => setMsgPage(recentQuery.data?.totalPages ?? 1)}
+                    className="h-7 w-7 p-0"
+                    title="Last page"
+                  >
+                    <ChevronsRight className="h-3.5 w-3.5" />
                   </Button>
                 </div>
               </div>
