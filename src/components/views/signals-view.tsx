@@ -373,7 +373,9 @@ export function SignalsView() {
                       <td className="px-3 py-2.5 text-right">
                         {s.evaluation ? <RMultiple value={s.evaluation.rMultiple} /> : <span className="text-xs text-muted-foreground">—</span>}
                       </td>
-                      <td className="px-3 py-2.5 text-xs text-muted-foreground">{fmtDate(s.postedAt)}</td>
+                      <td className="px-3 py-2.5 text-xs text-muted-foreground">
+                        {fmtDate(s.postedAt, { year: 'numeric', month: 'short', day: 'numeric' })}
+                      </td>
                     </tr>
                   ))}
             </tbody>
