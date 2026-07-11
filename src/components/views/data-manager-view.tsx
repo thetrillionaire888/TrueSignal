@@ -478,49 +478,100 @@ function ImportTab() {
 
     try {
       if (csvFile) {
-        // ── Streaming upload for files (handles 400MB+ without OOM) ────────
-        // Uses multipart/form-data — the browser streams the file from disk
-        // to the network without loading it all into memory.
+        // ── Chunked upload for files (handles 400MB+ without connection resets)
+        // Splits the file into 5MB chunks on the frontend, sends each as a
+        // separate small JSON request. The server maintains a per-upload
+        // StreamingCsvParser session and feeds each chunk to it.
         //
-        // The server returns 202 Accepted immediately and processes the file
-        // in the background. Progress + final result come via Socket.IO
-        // (handled by the useCollectorSocket hook above).
-        const formData = new FormData()
-        formData.append('file', csvFile)
+        // This avoids ERR_CONNECTION_RESET from proxy layers that can't
+        // handle 400MB+ single requests.
+        const CHUNK_SIZE = 5 * 1024 * 1024 // 5MB per chunk
+        const fileSize = csvFile.size
+        const totalChunks = Math.ceil(fileSize / CHUNK_SIZE)
+        const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 
-        const params = new URLSearchParams({
-          XTransformPort: '3001',
+        setProgress({
+          jobId: uploadId,
+          phase: 'importing',
+          message: `Starting chunked upload: ${totalChunks} chunks (${(fileSize / 1024 / 1024).toFixed(1)} MB)`,
+          parsed: 0,
+          inserted: 0,
+          skipped: 0,
           instrument,
-          source,
           timeframe,
         })
-        // Call the collector directly via Caddy's XTransformPort proxy.
-        // This bypasses Next.js (port 3000) and goes straight to the
-        // collector (port 3001) — one fewer proxy layer for large uploads.
-        // Caddy streams the request body without buffering.
-        const res = await fetch(`/api/import-csv-stream?${params}`, {
-          method: 'POST',
-          body: formData,
-        })
-        // Read the response as text first, then try to parse as JSON.
-        const responseText = await res.text()
-        let data: unknown
-        try {
-          data = JSON.parse(responseText)
-        } catch {
-          // Response is not JSON — could be an HTML error page from the proxy
-          throw new Error(
-            `Server returned ${res.status} ${res.statusText}. ` +
-            `Response was not JSON (first 200 chars): ${responseText.slice(0, 200)}`
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE
+          const end = Math.min(start + CHUNK_SIZE, fileSize)
+          const chunkBlob = csvFile.slice(start, end)
+          const chunkText = await chunkBlob.text()
+          const isLast = i === totalChunks - 1
+
+          const chunkRes = await fetch(
+            `/api/import-csv-chunk?XTransformPort=3001`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                uploadId,
+                instrument,
+                source,
+                timeframe,
+                chunkIndex: i,
+                totalChunks,
+                data: chunkText,
+                isLast,
+              }),
+            }
           )
+
+          if (!chunkRes.ok) {
+            const errText = await chunkRes.text().catch(() => 'unknown error')
+            throw new Error(`Chunk ${i + 1}/${totalChunks} failed: HTTP ${chunkRes.status} — ${errText.slice(0, 200)}`)
+          }
+
+          // Update progress from the chunk response
+          const chunkData = await chunkRes.json().catch(() => ({}))
+          if (isLast) {
+            // Last chunk — the response contains the final result
+            const finalResult = chunkData as {
+              instrument: string
+              source: string
+              timeframe: string
+              parsedBars: number
+              inserted: number
+              skipped: number
+              sourceTimeframe: string
+              dateRange: { from: string | null; to: string | null }
+            }
+            setResult({
+              instrument: finalResult.instrument,
+              source: finalResult.source,
+              timeframe: finalResult.timeframe,
+              parsedBars: finalResult.parsedBars ?? 0,
+              storedBars: finalResult.parsedBars ?? 0,
+              inserted: finalResult.inserted ?? 0,
+              skipped: finalResult.skipped ?? 0,
+              aggregated: false,
+              sourceTimeframe: finalResult.sourceTimeframe ?? 'm1',
+              dateRange: finalResult.dateRange ?? { from: null, to: null },
+            })
+            setIsImporting(false)
+          } else {
+            // Intermediate chunk — update progress
+            setProgress({
+              jobId: uploadId,
+              phase: 'importing',
+              message: `Uploading chunk ${i + 1}/${totalChunks} (${((i + 1) * CHUNK_SIZE / 1024 / 1024).toFixed(1)}/${(fileSize / 1024 / 1024).toFixed(1)} MB) — ${chunkData.totalParsed ?? 0} bars parsed`,
+              parsed: chunkData.totalParsed ?? 0,
+              inserted: chunkData.totalInserted ?? 0,
+              skipped: chunkData.totalSkipped ?? 0,
+              instrument,
+              timeframe,
+            })
+          }
         }
-        if (!res.ok && res.status !== 202) {
-          const errMsg = (data as { error?: string }).error ?? `HTTP ${res.status} ${res.statusText}`
-          throw new Error(errMsg)
-        }
-        // 202 Accepted = job started. The actual result will arrive via
-        // Socket.IO. Don't set isImporting=false here — keep the spinner
-        // running until the 'complete' event arrives.
       } else {
         // ── JSON endpoint for pasted CSV (small data, no streaming needed) ─
         if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
