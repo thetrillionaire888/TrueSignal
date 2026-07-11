@@ -28,6 +28,9 @@ import {
   BarChart3,
   LineChart,
   ListChecks,
+  Table2,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 
 type CacheSummary = {
@@ -95,15 +98,19 @@ const TIMEFRAMES = [
 ]
 
 export function DataManagerView() {
-  const [tab, setTab] = React.useState('import')
+  const [tab, setTab] = React.useState('fetch')
 
   return (
     <div className="space-y-5">
       <Tabs value={tab} onValueChange={setTab}>
-        <TabsList className="grid w-full grid-cols-3 max-w-md">
-          <TabsTrigger value="import" className="gap-1.5">
+        <TabsList className="grid w-full grid-cols-4 max-w-lg">
+          <TabsTrigger value="fetch" className="gap-1.5">
             <CloudDownload className="h-3.5 w-3.5" />
             Fetch
+          </TabsTrigger>
+          <TabsTrigger value="browse" className="gap-1.5">
+            <Table2 className="h-3.5 w-3.5" />
+            Browse
           </TabsTrigger>
           <TabsTrigger value="export" className="gap-1.5">
             <Download className="h-3.5 w-3.5" />
@@ -111,12 +118,15 @@ export function DataManagerView() {
           </TabsTrigger>
           <TabsTrigger value="analyze" className="gap-1.5">
             <BarChart3 className="h-3.5 w-3.5" />
-            View & Analyze
+            Analyze
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="import" className="mt-5">
-          <ImportTab />
+        <TabsContent value="fetch" className="mt-5">
+          <FetchTab />
+        </TabsContent>
+        <TabsContent value="browse" className="mt-5">
+          <BrowseTab />
         </TabsContent>
         <TabsContent value="export" className="mt-5">
           <ExportTab />
@@ -129,9 +139,9 @@ export function DataManagerView() {
   )
 }
 
-// ── Import Tab ───────────────────────────────────────────────────────────────
+// ── Fetch Tab ───────────────────────────────────────────────────────────────
 
-function ImportTab() {
+function FetchTab() {
   const [selectedSource, setSelectedSource] = React.useState<string>('dukascopy')
   const [instrument, setInstrument] = React.useState('xauusd')
   const [timeframe, setTimeframe] = React.useState('m15')
@@ -390,6 +400,220 @@ function ImportTab() {
           </div>
         )}
       </ChartCard>
+    </div>
+  )
+}
+
+// ── Browse Tab (Data Viewer) ────────────────────────────────────────────────
+
+type BrowseResponse = {
+  bars: Array<{
+    source: string; instrument: string; timeframe: string;
+    timestamp: number; open: number; high: number; low: number;
+    close: number; volume: number; fetchedAt: string;
+  }>
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
+  filters: {
+    instruments: string[]
+    sources: string[]
+    timeframes: string[]
+  }
+}
+
+function BrowseTab() {
+  const [instrument, setInstrument] = React.useState('')
+  const [source, setSource] = React.useState('')
+  const [timeframe, setTimeframe] = React.useState('')
+  const [fromDate, setFromDate] = React.useState('')
+  const [toDate, setToDate] = React.useState('')
+  const [page, setPage] = React.useState(1)
+  const [pageSize, setPageSize] = React.useState(50)
+
+  // Build query params
+  const params = new URLSearchParams()
+  if (instrument) params.set('instrument', instrument)
+  if (source) params.set('source', source)
+  if (timeframe) params.set('timeframe', timeframe)
+  if (fromDate) params.set('from', new Date(fromDate).toISOString())
+  if (toDate) params.set('to', new Date(toDate).toISOString())
+  params.set('page', String(page))
+  params.set('pageSize', String(pageSize))
+
+  const { data, isLoading, isFetching } = useQuery<BrowseResponse>({
+    queryKey: ['browse-bars', params.toString()],
+    queryFn: () => collectorFetch<BrowseResponse>(`/api/browse-bars?${params.toString()}`),
+    staleTime: 30_000,
+  })
+
+  // Reset page when filters change
+  const filterKey = `${instrument}|${source}|${timeframe}|${fromDate}|${toDate}|${pageSize}`
+  React.useEffect(() => { setPage(1) }, [filterKey])
+
+  const fmtPrice = (n: number) => {
+    if (Math.abs(n) < 1) return n.toFixed(4)
+    if (Math.abs(n) < 100) return n.toFixed(2)
+    return n.toLocaleString('en-US', { maximumFractionDigits: 2 })
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Filters */}
+      <ChartCard title="Price Bar Browser" description="Browse cached OHLCV data with filters. Results are paginated — max 500 rows per page.">
+        <div className="space-y-3">
+          {/* Row 1: Instrument + Source + Timeframe */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div>
+              <Label className="mb-1 block text-[10px]">Instrument</Label>
+              <Select value={instrument || 'all'} onValueChange={(v) => setInstrument(v === 'all' ? '' : v)}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="All" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All instruments</SelectItem>
+                  {data?.filters.instruments.map((i) => (
+                    <SelectItem key={i} value={i}>{i.toUpperCase()}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="mb-1 block text-[10px]">Source</Label>
+              <Select value={source || 'all'} onValueChange={(v) => setSource(v === 'all' ? '' : v)}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="All" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All sources</SelectItem>
+                  {data?.filters.sources.map((s) => (
+                    <SelectItem key={s} value={s} className="capitalize">{s}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="mb-1 block text-[10px]">Timeframe</Label>
+              <Select value={timeframe || 'all'} onValueChange={(v) => setTimeframe(v === 'all' ? '' : v)}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="All" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All timeframes</SelectItem>
+                  {data?.filters.timeframes.map((t) => (
+                    <SelectItem key={t} value={t}>{t}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="mb-1 block text-[10px]">Page size</Label>
+              <Select value={String(pageSize)} onValueChange={(v) => setPageSize(Number(v))}>
+                <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="25">25</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="100">100</SelectItem>
+                  <SelectItem value="250">250</SelectItem>
+                  <SelectItem value="500">500</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {/* Row 2: Date range */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-2">
+            <div>
+              <Label className="mb-1 block text-[10px]">From date</Label>
+              <Input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="h-8 text-xs" />
+            </div>
+            <div>
+              <Label className="mb-1 block text-[10px]">To date</Label>
+              <Input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="h-8 text-xs" />
+            </div>
+          </div>
+        </div>
+      </ChartCard>
+
+      {/* Results summary */}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span>
+          {isFetching ? 'Loading…' : data
+            ? `${fmtInt(data.total)} bars total · showing ${data.bars.length} on page ${data.page}/${data.totalPages || 1}`
+            : 'No data'
+          }
+        </span>
+        {data && data.totalPages > 1 && (
+          <div className="flex items-center gap-1.5">
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)} className="h-7 w-7 p-0">
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <span className="tnum">{page} / {data.totalPages}</span>
+            <Button variant="outline" size="sm" disabled={page >= data.totalPages} onClick={() => setPage(page + 1)} className="h-7 w-7 p-0">
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* Data table */}
+      <div className="overflow-hidden rounded-xl border border-border/70 bg-card">
+        <div className="overflow-x-auto scroll-thin">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-border/60 bg-muted/30 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                <th className="px-2 py-2 font-medium">Source</th>
+                <th className="px-2 py-2 font-medium">Instrument</th>
+                <th className="px-2 py-2 font-medium">TF</th>
+                <th className="px-2 py-2 font-medium">Timestamp (UTC)</th>
+                <th className="px-2 py-2 text-right font-medium">Open</th>
+                <th className="px-2 py-2 text-right font-medium">High</th>
+                <th className="px-2 py-2 text-right font-medium">Low</th>
+                <th className="px-2 py-2 text-right font-medium">Close</th>
+                <th className="px-2 py-2 text-right font-medium">Volume</th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoading ? (
+                Array.from({ length: 10 }).map((_, i) => (
+                  <tr key={i} className="border-b border-border/40">
+                    {Array.from({ length: 9 }).map((__, j) => (
+                      <td key={j} className="px-2 py-2"><div className="h-3 animate-pulse rounded bg-muted" /></td>
+                    ))}
+                  </tr>
+                ))
+              ) : data && data.bars.length > 0 ? (
+                data.bars.map((bar, i) => (
+                  <tr key={i} className="border-b border-border/40 hover:bg-muted/30">
+                    <td className="px-2 py-1.5">
+                      <span className={cn(
+                        'rounded px-1 py-0.5 text-[9px] font-medium capitalize',
+                        bar.source === 'dukascopy' ? 'bg-teal-500/12 text-teal-600 dark:text-teal-400' :
+                        bar.source === 'binance' ? 'bg-amber-500/12 text-amber-600 dark:text-amber-400' :
+                        bar.source === 'yahoo' ? 'bg-violet-500/12 text-violet-600 dark:text-violet-400' :
+                        'bg-slate-500/12 text-slate-600 dark:text-slate-400'
+                      )}>
+                        {bar.source}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1.5 font-medium">{bar.instrument.toUpperCase()}</td>
+                    <td className="px-2 py-1.5 text-muted-foreground">{bar.timeframe}</td>
+                    <td className="px-2 py-1.5 text-muted-foreground tnum">
+                      {new Date(bar.timestamp).toISOString().replace('T', ' ').slice(0, 19)}
+                    </td>
+                    <td className="px-2 py-1.5 text-right tnum">{fmtPrice(bar.open)}</td>
+                    <td className="px-2 py-1.5 text-right tnum text-emerald-600 dark:text-emerald-400/70">{fmtPrice(bar.high)}</td>
+                    <td className="px-2 py-1.5 text-right tnum text-rose-600 dark:text-rose-400/70">{fmtPrice(bar.low)}</td>
+                    <td className="px-2 py-1.5 text-right tnum font-medium">{fmtPrice(bar.close)}</td>
+                    <td className="px-2 py-1.5 text-right tnum text-muted-foreground">{bar.volume.toFixed(2)}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={9} className="px-2 py-8 text-center text-sm text-muted-foreground">
+                    No bars found matching the filters.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   )
 }

@@ -373,6 +373,60 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       return json(res, 200, summary);
     }
 
+    // ── Browse price bars (paginated, filtered) ─────────────────────────────
+    // Query params: instrument, source, timeframe, from (ISO date), to (ISO date),
+    //               page (1-based), pageSize (max 500)
+    if (path === "/api/browse-bars" && req.method === "GET") {
+      const instrument = url.searchParams.get("instrument") || undefined;
+      const source = url.searchParams.get("source") || undefined;
+      const timeframe = url.searchParams.get("timeframe") || undefined;
+      const fromIso = url.searchParams.get("from");
+      const toIso = url.searchParams.get("to");
+      const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
+      const pageSize = Math.min(500, Math.max(10, parseInt(url.searchParams.get("pageSize") || "50", 10)));
+
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+      if (instrument) { conditions.push("instrument = ?"); params.push(instrument.toLowerCase()); }
+      if (source) { conditions.push("source = ?"); params.push(source.toLowerCase()); }
+      if (timeframe) { conditions.push("timeframe = ?"); params.push(timeframe.toLowerCase()); }
+      if (fromIso) { conditions.push("timestamp >= ?"); params.push(new Date(fromIso).getTime()); }
+      if (toIso) { conditions.push("timestamp < ?"); params.push(new Date(toIso).getTime()); }
+
+      const whereClause = conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : "";
+      const offset = (page - 1) * pageSize;
+
+      const countRow = sqlite.prepare(`SELECT COUNT(*) as c FROM market.PriceBar ${whereClause}`).get(...params) as { c: number };
+      const rows = sqlite.prepare(
+        `SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt
+         FROM market.PriceBar ${whereClause}
+         ORDER BY timestamp DESC
+         LIMIT ? OFFSET ?`
+      ).all(...params, pageSize, offset) as Array<{
+        source: string; instrument: string; timeframe: string;
+        timestamp: number; open: number; high: number; low: number;
+        close: number; volume: number; fetchedAt: string;
+      }>;
+
+      // Get available instruments + sources + timeframes for filter dropdowns
+      const instruments = sqlite.prepare("SELECT DISTINCT instrument FROM market.PriceBar ORDER BY instrument").all() as Array<{ instrument: string }>;
+      const sources = sqlite.prepare("SELECT DISTINCT source FROM market.PriceBar ORDER BY source").all() as Array<{ source: string }>;
+      const timeframes = sqlite.prepare("SELECT DISTINCT timeframe FROM market.PriceBar ORDER BY timeframe").all() as Array<{ timeframe: string }>;
+
+      return json(res, 200, {
+        bars: rows,
+        total: countRow.c,
+        page,
+        pageSize,
+        totalPages: Math.ceil(countRow.c / pageSize),
+        filters: {
+          instruments: instruments.map(i => i.instrument),
+          sources: sources.map(s => s.source),
+          timeframes: timeframes.map(t => t.timeframe),
+        },
+      });
+    }
+
     // ── Export bars (PriceBar cache) ────────────────────────────────────────
     if (path === "/api/export-bars" && req.method === "GET") {
       const format = url.searchParams.get("format") || "csv";
