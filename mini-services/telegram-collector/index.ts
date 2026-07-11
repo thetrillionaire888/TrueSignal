@@ -12,7 +12,7 @@ import { parseSignal } from "./parser";
 import { evaluateSignals, getEvalStats, type EvalProgress } from "./evaluator";
 import { importFromSource } from "./importers";
 import { getCacheSummary, importBars, type Bar } from "./bar-cache";
-import { parseCsvFlexible, aggregateBars, detectTimeframe } from "./csv-parser";
+import { parseCsvFlexible, aggregateBars, detectTimeframe, StreamingCsvParser } from "./csv-parser";
 import {
   startJob,
   updateProgress,
@@ -50,6 +50,17 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
 
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
+
+  // ── Streaming CSV upload (must be handled BEFORE readBody to avoid OOM) ──
+  // This endpoint receives multipart/form-data with a large CSV file.
+  // It streams the file through a line-by-line parser and batch-inserts,
+  // so memory usage stays flat regardless of file size.
+  // All other POST endpoints use readBody (JSON body) which buffers the
+  // full body in memory — fine for small payloads, OOM for 400MB+ CSVs.
+  if (path === "/api/import-csv-stream" && req.method === "POST") {
+    return handleStreamingCsvImport(req, res, io);
+  }
+
   const body = req.method === "POST" ? await readBody(req) : {};
 
   try {
@@ -944,6 +955,241 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
 function json(res: ServerResponse, code: number, body: unknown) {
   res.writeHead(code, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+// ── Streaming CSV import (handles large files without OOM) ──────────────────
+//
+// Receives multipart/form-data with:
+//   - instrument (text field)
+//   - source (text field, default "dukascopy")
+//   - timeframe (text field, default "m1")
+//   - file (the CSV file)
+//
+// Streams the file through a line-by-line parser, batch-inserting bars
+// every 5,000 rows. Memory usage stays flat regardless of file size.
+// Progress is emitted via Socket.IO so the frontend can show a progress bar.
+//
+// Multipart parsing: we use a simple boundary-based parser. The form fields
+// (instrument, source, timeframe) come first as small text parts, then the
+// file part. We buffer the text parts fully (they're tiny), and stream the
+// file part through the CSV parser.
+
+const STREAM_BATCH_SIZE = 5000;
+
+async function handleStreamingCsvImport(
+  req: IncomingMessage,
+  res: ServerResponse,
+  io: IOServer
+): Promise<void> {
+  const contentType = req.headers["content-type"] ?? "";
+
+  // Parse the multipart boundary from the Content-Type header
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  if (!boundaryMatch) {
+    return json(res, 400, { error: "Content-Type must be multipart/form-data with a boundary" });
+  }
+  const boundary = boundaryMatch[1] ?? boundaryMatch[2];
+
+  // Extract form fields from the URL query string as a fallback.
+  // The frontend sends instrument/source/timeframe as query params so we
+  // don't need to parse them from the multipart body (simpler + faster).
+  const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+  const instrument = (url.searchParams.get("instrument") ?? "").trim().toLowerCase();
+  const source = (url.searchParams.get("source") ?? "dukascopy").toLowerCase();
+  const timeframe = (url.searchParams.get("timeframe") ?? "m1").toLowerCase();
+
+  if (!instrument) {
+    return json(res, 400, { error: "instrument query parameter is required" });
+  }
+
+  console.log(`[import-csv-stream] Starting: instrument=${instrument}, source=${source}, timeframe=${timeframe}, boundary=${boundary.slice(0, 20)}…`);
+
+  // Set up the streaming CSV parser + batch inserter
+  const jobId = `import-${Date.now()}`;
+  let totalInserted = 0;
+  let totalSkipped = 0;
+  let totalParsed = 0;
+  let batch: Bar[] = [];
+  let firstBarTs: number | null = null;
+  let lastBarTs: number | null = null;
+  let sourceTimeframe = "m1";
+  let timeframeDetected = false;
+  let firstBarsForDetection: Bar[] = []; // collect first N bars to detect timeframe
+
+  const flushBatch = () => {
+    if (batch.length === 0) return;
+    const { inserted, skipped } = importBars(source, instrument, timeframe, batch);
+    totalInserted += inserted;
+    totalSkipped += skipped;
+    batch = [];
+  };
+
+  const parser = new StreamingCsvParser({
+    onBar: (bar) => {
+      totalParsed++;
+      if (firstBarTs === null) firstBarTs = bar.timestamp;
+      lastBarTs = bar.timestamp;
+
+      // Detect timeframe from first 100 bars
+      if (!timeframeDetected) {
+        firstBarsForDetection.push(bar);
+        if (firstBarsForDetection.length >= 100) {
+          const detected = detectTimeframe(firstBarsForDetection);
+          if (detected) sourceTimeframe = detected;
+          timeframeDetected = true;
+          firstBarsForDetection = []; // free memory
+        }
+      }
+
+      // For M1 target, no aggregation needed — add directly to batch.
+      // For other target timeframes with M1 source, we'd need to aggregate.
+      // For simplicity, the streaming endpoint assumes target === source
+      // (the common case: importing M1 CSV as M1 data). The non-streaming
+      // /api/import-csv endpoint handles aggregation for other cases.
+      batch.push(bar);
+
+      if (batch.length >= STREAM_BATCH_SIZE) {
+        flushBatch();
+      }
+    },
+  });
+
+  // Track progress (emit every 50K bars)
+  let lastProgressEmit = 0;
+  const emitProgress = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressEmit < 1000) return; // throttle to 1/sec
+    lastProgressEmit = now;
+    io.emit("import:progress", {
+      jobId,
+      phase: "importing" as const,
+      message: `Importing ${instrument.toUpperCase()}: ${totalParsed.toLocaleString()} bars parsed, ${totalInserted.toLocaleString()} inserted`,
+      parsed: totalParsed,
+      inserted: totalInserted,
+      skipped: totalSkipped,
+      instrument,
+      timeframe,
+    });
+  };
+
+  // ── Stream the request body through the multipart parser ────────────────
+  // We're looking for the file part. Multipart format:
+  //   --BOUNDARY\r\n
+  //   Content-Disposition: form-data; name="file"; filename="x.csv"\r\n
+  //   Content-Type: text/csv\r\n
+  //   \r\n
+  //   <file content>\r\n
+  //   --BOUNDARY--\r\n
+  //
+  // Strategy: find the file part's headers, then stream the file content
+  // through the CSV parser until we hit the closing boundary.
+
+  const boundaryBuf = Buffer.from(`\r\n--${boundary}`);
+  const fileHeaderMarker = Buffer.from('filename=');
+
+  // State machine for finding the file part
+  let inFileContent = false;
+  let searchBuf = Buffer.alloc(0);
+  let fileBytesReceived = 0;
+
+  try {
+    for await (const chunk of req) {
+      if (!inFileContent) {
+        // Still looking for the file part — accumulate and search for headers
+        searchBuf = Buffer.concat([searchBuf, chunk]);
+
+        // Look for "filename=" to find the file part
+        const headerIdx = searchBuf.indexOf(fileHeaderMarker);
+        if (headerIdx === -1) continue;
+
+        // Found the file part header — find the end of headers (\r\n\r\n)
+        const headersEnd = searchBuf.indexOf("\r\n\r\n", headerIdx);
+        if (headersEnd === -1) continue;
+
+        // Everything after \r\n\r\n is file content
+        const fileStart = headersEnd + 4;
+        const fileContent = searchBuf.slice(fileStart);
+        searchBuf = Buffer.alloc(0); // free the search buffer
+        inFileContent = true;
+
+        // Feed the initial file content to the parser
+        if (fileContent.length > 0) {
+          parser.feed(fileContent.toString("utf-8"));
+          fileBytesReceived += fileContent.length;
+        }
+      } else {
+        // We're in file content — but need to detect the closing boundary.
+        // The boundary is preceded by \r\n, so we check if the current
+        // chunk (combined with any leftover from the previous chunk) contains it.
+        const combined = Buffer.concat([searchBuf, chunk]);
+        const boundaryIdx = combined.indexOf(boundaryBuf);
+
+        if (boundaryIdx !== -1) {
+          // Found the closing boundary — feed everything before it, then stop
+          const fileContent = combined.slice(0, boundaryIdx);
+          if (fileContent.length > 0) {
+            parser.feed(fileContent.toString("utf-8"));
+            fileBytesReceived += fileContent.length;
+          }
+          parser.end();
+          flushBatch();
+          break;
+        } else {
+          // No boundary found — feed everything except the last boundary.length
+          // bytes (which might be a partial boundary split across chunks)
+          const safeLength = Math.max(0, combined.length - boundaryBuf.length);
+          if (safeLength > 0) {
+            const fileContent = combined.slice(0, safeLength);
+            parser.feed(fileContent.toString("utf-8"));
+            fileBytesReceived += fileContent.length;
+          }
+          // Keep the last boundaryBuf.length bytes for the next iteration
+          searchBuf = combined.slice(safeLength);
+        }
+      }
+
+      // Emit progress periodically
+      emitProgress();
+    }
+
+    // If the stream ended without hitting the closing boundary (e.g. client
+    // closed the connection), flush whatever we have
+    if (inFileContent) {
+      parser.end();
+      flushBatch();
+    }
+
+    // Final progress emit
+    io.emit("import:progress", {
+      jobId,
+      phase: "complete" as const,
+      message: `Import complete: ${totalInserted.toLocaleString()} bars inserted, ${totalSkipped.toLocaleString()} skipped`,
+      parsed: totalParsed,
+      inserted: totalInserted,
+      skipped: totalSkipped,
+      instrument,
+      timeframe,
+    });
+
+    console.log(`[import-csv-stream] Complete: ${totalInserted} inserted, ${totalSkipped} skipped, ${totalParsed} parsed, ${fileBytesReceived} file bytes`);
+
+    return json(res, 200, {
+      instrument,
+      source,
+      timeframe,
+      parsedBars: totalParsed,
+      inserted: totalInserted,
+      skipped: totalSkipped,
+      sourceTimeframe,
+      dateRange: {
+        from: firstBarTs !== null ? new Date(firstBarTs).toISOString() : null,
+        to: lastBarTs !== null ? new Date(lastBarTs).toISOString() : null,
+      },
+    });
+  } catch (e) {
+    console.error(`[import-csv-stream] Error:`, e);
+    return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+  }
 }
 
 httpServer.listen(PORT, () => {

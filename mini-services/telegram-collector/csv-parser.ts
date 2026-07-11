@@ -289,3 +289,208 @@ export function detectTimeframe(bars: Bar[]): string | null {
 
   return null;
 }
+
+// ── Streaming CSV parser (for large files) ──────────────────────────────────
+// Processes CSV data line-by-line as it arrives from a stream, calling
+// onBar() for each parsed bar. Memory usage stays flat regardless of file
+// size — only the current line + header are held in memory at any time.
+
+export type StreamParserOptions = {
+  onBar: (bar: Bar) => void;
+  onProgress?: (linesProcessed: number) => void;
+};
+
+export class StreamingCsvParser {
+  private buffer = "";
+  private headerParsed = false;
+  private delimiter = ",";
+  private colMap: Record<string, number> = {};
+  private hasSeparateDateTime = false;
+  private hasBidAsk = false;
+  private startIndex = 0;
+  private linesProcessed = 0;
+  private readonly onBar: (bar: Bar) => void;
+  private readonly onProgress?: (linesProcessed: number) => void;
+
+  constructor(opts: StreamParserOptions) {
+    this.onBar = opts.onBar;
+    this.onProgress = opts.onProgress;
+  }
+
+  /**
+   * Feed a chunk of text (from a stream). Parses complete lines and emits
+   * bars via the onBar callback. Incomplete lines are buffered until the
+   * next chunk.
+   */
+  feed(chunk: string): void {
+    this.buffer += chunk;
+
+    // Process complete lines (terminated by \n)
+    let newlineIdx: number;
+    while ((newlineIdx = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.slice(0, newlineIdx).replace(/\r$/, "");
+      this.buffer = this.buffer.slice(newlineIdx + 1);
+      this.processLine(line);
+    }
+  }
+
+  /**
+   * Call after the stream ends — flushes any remaining buffered line.
+   */
+  end(): void {
+    if (this.buffer.trim()) {
+      this.processLine(this.buffer);
+      this.buffer = "";
+    }
+  }
+
+  private processLine(line: string): void {
+    if (!line.trim()) return;
+
+    // First non-empty line: detect delimiter + parse header (or assume no header)
+    if (!this.headerParsed) {
+      this.delimiter = detectDelimiter(line);
+      const parsed = parseHeaderFromLine(line, this.delimiter);
+      this.colMap = parsed.colMap;
+      this.hasSeparateDateTime = parsed.hasSeparateDateTime;
+      this.hasBidAsk = parsed.hasBidAsk;
+      this.startIndex = parsed.startIndex;
+      this.headerParsed = true;
+
+      // If the first line was a header (startIndex === 1), skip it
+      if (this.startIndex === 1) {
+        return;
+      }
+      // Otherwise (no header), fall through and parse this line as data
+    }
+
+    if (this.startIndex > 0) {
+      // Header was already consumed — only parse data lines now
+    }
+
+    const bar = parseLineToBar(line, this.delimiter, this.colMap, this.hasSeparateDateTime, this.hasBidAsk);
+    if (bar) {
+      this.onBar(bar);
+    }
+
+    this.linesProcessed++;
+    if (this.onProgress && this.linesProcessed % 10000 === 0) {
+      this.onProgress(this.linesProcessed);
+    }
+  }
+
+  getLinesProcessed(): number {
+    return this.linesProcessed;
+  }
+}
+
+/**
+ * Parse a single CSV line into a Bar (or null if invalid).
+ * Shared between the streaming and non-streaming parsers.
+ */
+function parseLineToBar(
+  line: string,
+  delimiter: string,
+  colMap: Record<string, number>,
+  hasSeparateDateTime: boolean,
+  hasBidAsk: boolean
+): Bar | null {
+  const cols = line.split(delimiter).map((c) => c.trim());
+  if (cols.length < 5) return null;
+
+  // Parse timestamp
+  let ts: number;
+  if (hasSeparateDateTime) {
+    ts = parseTimestamp(`${cols[colMap.date!]} ${cols[colMap.time!]}`);
+  } else if (colMap.datetime !== undefined) {
+    ts = parseTimestamp(cols[colMap.datetime]);
+  } else {
+    return null;
+  }
+  if (isNaN(ts)) return null;
+
+  let open: number, high: number, low: number, close: number;
+  let volume = 0;
+
+  if (hasBidAsk) {
+    const bid = parseFloat(cols[colMap.bid!]);
+    const ask = parseFloat(cols[colMap.ask!]);
+    if (isNaN(bid) || isNaN(ask)) return null;
+    const mid = (bid + ask) / 2;
+    open = high = low = close = mid;
+    if (colMap.volume !== undefined) volume = parseFloat(cols[colMap.volume]) || 0;
+  } else {
+    open = parseFloat(cols[colMap.open!]);
+    high = parseFloat(cols[colMap.high!]);
+    low = parseFloat(cols[colMap.low!]);
+    close = parseFloat(cols[colMap.close!]);
+    if (colMap.volume !== undefined) volume = parseFloat(cols[colMap.volume]) || 0;
+  }
+
+  if (isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close)) return null;
+  if (open === 0 && high === 0 && low === 0 && close === 0) return null;
+
+  return { timestamp: ts, open, high, low, close, volume };
+}
+
+/**
+ * Parse a header line to determine column mapping.
+ * Returns whether this line is a header (vs. data) and the column map.
+ */
+function parseHeaderFromLine(line: string, delimiter: string): {
+  colMap: Record<string, number>;
+  hasSeparateDateTime: boolean;
+  hasBidAsk: boolean;
+  startIndex: number;
+} {
+  const firstCols = line.split(delimiter).map((c) => c.trim().toLowerCase());
+  const headerKeywords = [
+    "date", "time", "datetime", "timestamp",
+    "open", "high", "low", "close", "volume", "vol",
+    "bid", "ask",
+  ];
+  const isHeader = firstCols.some((c) => headerKeywords.includes(c));
+
+  const colMap: Record<string, number> = {};
+  let startIndex = 0;
+
+  if (isHeader) {
+    startIndex = 1;
+    firstCols.forEach((c, i) => {
+      if (c === "date") colMap.date = i;
+      else if (c === "time") colMap.time = i;
+      else if (c === "datetime" || c === "timestamp") colMap.datetime = i;
+      else if (c === "open" || c === "o") colMap.open = i;
+      else if (c === "high" || c === "h") colMap.high = i;
+      else if (c === "low" || c === "l") colMap.low = i;
+      else if (c === "close" || c === "c") colMap.close = i;
+      else if (c === "volume" || c === "vol") colMap.volume = i;
+      else if (c === "bid") colMap.bid = i;
+      else if (c === "ask") colMap.ask = i;
+    });
+  } else {
+    const n = firstCols.length;
+    if (n >= 6) {
+      colMap.datetime = 0;
+      colMap.open = 1;
+      colMap.high = 2;
+      colMap.low = 3;
+      colMap.close = 4;
+      colMap.volume = 5;
+    } else if (n >= 5) {
+      colMap.datetime = 0;
+      colMap.open = 1;
+      colMap.high = 2;
+      colMap.low = 3;
+      colMap.close = 4;
+    }
+  }
+
+  return {
+    colMap,
+    hasSeparateDateTime: colMap.date !== undefined && colMap.time !== undefined,
+    hasBidAsk: colMap.bid !== undefined && colMap.ask !== undefined,
+    startIndex,
+  };
+}
+

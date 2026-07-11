@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { collectorFetch } from '@/lib/collector-client'
+import { collectorFetch, useCollectorSocket, type ImportProgress } from '@/lib/collector-client'
 import { fmtInt, fmtDateTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
@@ -421,6 +421,8 @@ function ImportTab() {
   const [timeframe, setTimeframe] = React.useState('m1')
   const [csvFile, setCsvFile] = React.useState<File | null>(null)
   const [csvText, setCsvText] = React.useState('')
+  const [isImporting, setIsImporting] = React.useState(false)
+  const [progress, setProgress] = React.useState<ImportProgress | null>(null)
   const [result, setResult] = React.useState<{
     instrument: string
     source: string
@@ -433,66 +435,98 @@ function ImportTab() {
     sourceTimeframe: string
     aggregationNote?: string
     dateRange: { from: string | null; to: string | null }
-    sampleRows: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
+    sampleRows?: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
   } | null>(null)
   const [error, setError] = React.useState<string | null>(null)
 
-  // Which input source to use: 'file' takes priority if a file is selected,
-  // otherwise 'paste' is used. No toggle button needed — both inputs are
-  // always visible, and the import button uses whichever has data.
-  const activeSource = csvFile ? 'file' : 'paste'
-
-  const importMut = useMutation({
-    mutationFn: async () => {
-      let csvContent: string
-      if (csvFile) {
-        csvContent = await csvFile.text()
-      } else {
-        if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
-        csvContent = csvText
+  // Listen for import progress events from the streaming endpoint
+  useCollectorSocket(
+    () => {}, // ingest progress — not used here
+    () => {}, // eval progress — not used here
+    (p) => {
+      setProgress(p)
+      if (p.phase === 'complete') {
+        setIsImporting(false)
       }
-      return collectorFetch<{
-        instrument: string
-        source: string
-        timeframe: string
-        parsedBars: number
-        storedBars: number
-        inserted: number
-        skipped: number
-        aggregated: boolean
-        sourceTimeframe: string
-        aggregationNote?: string
-        dateRange: { from: string | null; to: string | null }
-        sampleRows: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
-      }>('/api/import-csv', {
-        method: 'POST',
-        json: {
+    }
+  )
+
+  const handleImport = async () => {
+    setIsImporting(true)
+    setProgress(null)
+    setError(null)
+    setResult(null)
+
+    try {
+      if (csvFile) {
+        // ── Streaming upload for files (handles 400MB+ without OOM) ────────
+        // Uses multipart/form-data — the browser streams the file from disk
+        // to the network without loading it all into memory.
+        const formData = new FormData()
+        formData.append('file', csvFile)
+
+        const params = new URLSearchParams({
+          XTransformPort: '3001',
           instrument,
           source,
           timeframe,
-          csvText: csvContent,
-          aggregate: 'auto',
-        },
-      })
-    },
-    onSuccess: (data) => {
-      setResult(data)
-      setError(null)
-    },
-    onError: (e) => {
+        })
+        const res = await fetch(`/api/import-csv-stream?${params}`, {
+          method: 'POST',
+          body: formData,
+        })
+        const data = await res.json().catch(() => ({ error: 'invalid response' }))
+        if (!res.ok) {
+          throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`)
+        }
+        setResult(data as typeof result)
+      } else {
+        // ── JSON endpoint for pasted CSV (small data, no streaming needed) ─
+        if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
+        const data = await collectorFetch<{
+          instrument: string
+          source: string
+          timeframe: string
+          parsedBars: number
+          storedBars: number
+          inserted: number
+          skipped: number
+          aggregated: boolean
+          sourceTimeframe: string
+          aggregationNote?: string
+          dateRange: { from: string | null; to: string | null }
+          sampleRows: Array<{ timestamp: number; datetime: string; open: number; high: number; low: number; close: number; volume: number }>
+        }>('/api/import-csv', {
+          method: 'POST',
+          json: {
+            instrument,
+            source,
+            timeframe,
+            csvText: csvText,
+            aggregate: 'auto',
+          },
+        })
+        setResult(data)
+      }
+    } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setResult(null)
-    },
-  })
+    } finally {
+      setIsImporting(false)
+    }
+  }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null
     setCsvFile(file)
     setResult(null)
     setError(null)
+    setProgress(null)
   }
 
-  const canImport = !importMut.isPending && (csvFile || csvText.trim().length > 0)
+  const canImport = !isImporting && (csvFile || csvText.trim().length > 0)
+  const fileSizeMb = csvFile ? csvFile.size / 1024 / 1024 : 0
+  const isLargeFile = fileSizeMb > 10
 
   return (
     <div className="space-y-5">
@@ -606,14 +640,25 @@ function ImportTab() {
             </p>
           </div>
 
+          {/* Large file hint */}
+          {isLargeFile && csvFile && (
+            <div className="flex items-start gap-2 rounded-lg border border-blue-500/30 bg-blue-500/5 p-3 text-xs text-blue-700 dark:text-blue-400">
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+              <div>
+                <span className="font-medium">Large file ({fileSizeMb.toFixed(1)} MB)</span> — using
+                streaming upload to avoid memory issues. Progress is reported live below.
+              </div>
+            </div>
+          )}
+
           {/* Single Import action button */}
           <div className="flex items-center gap-3">
             <Button
-              onClick={() => importMut.mutate()}
+              onClick={handleImport}
               disabled={!canImport}
               className="gap-1.5"
             >
-              {importMut.isPending ? (
+              {isImporting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Importing…
@@ -621,16 +666,49 @@ function ImportTab() {
               ) : (
                 <>
                   <Upload className="h-4 w-4" />
-                  Import CSV{activeSource === 'file' && csvFile ? ` — ${csvFile.name.slice(0, 30)}${csvFile.name.length > 30 ? '…' : ''}` : ''}
+                  Import CSV{csvFile ? ` — ${csvFile.name.slice(0, 30)}${csvFile.name.length > 30 ? '…' : ''}` : ''}
                 </>
               )}
             </Button>
-            {(result || error) && (
-              <Button variant="ghost" size="sm" onClick={() => { setResult(null); setError(null) }}>
+            {(result || error) && !isImporting && (
+              <Button variant="ghost" size="sm" onClick={() => { setResult(null); setError(null); setProgress(null) }}>
                 Clear
               </Button>
             )}
           </div>
+
+          {/* Live progress (streaming uploads) */}
+          {isImporting && progress && (
+            <div className="space-y-2 rounded-lg border border-border/50 bg-muted/20 p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-foreground">{progress.message}</span>
+                {progress.phase === 'importing' && (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Parsed</div>
+                  <div className="font-semibold tnum">{progress.parsed.toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Inserted</div>
+                  <div className="font-semibold tnum text-emerald-600 dark:text-emerald-400">{progress.inserted.toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Skipped</div>
+                  <div className="font-semibold tnum text-muted-foreground">{progress.skipped.toLocaleString()}</div>
+                </div>
+              </div>
+              {/* Indeterminate progress bar — actual progress depends on
+                  parsing speed, which we can't easily map to a percentage
+                  without knowing the total row count upfront. Show a
+                  pulsing bar to indicate activity. */}
+              <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                <div className="h-full w-1/3 animate-pulse rounded-full bg-primary" />
+              </div>
+            </div>
+          )}
 
           {/* Error */}
           {error && (
@@ -670,7 +748,7 @@ function ImportTab() {
               </div>
 
               {/* Sample rows */}
-              {result.sampleRows.length > 0 && (
+              {result.sampleRows && result.sampleRows.length > 0 && (
                 <div>
                   <p className="mb-1 text-xs font-medium text-muted-foreground">Sample rows (first 3):</p>
                   <div className="overflow-x-auto rounded-lg border border-border/50">

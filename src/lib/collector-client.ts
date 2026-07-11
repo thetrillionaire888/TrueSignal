@@ -112,18 +112,32 @@ export type EvalProgress = {
   }>
 }
 
+export type ImportProgress = {
+  jobId: string
+  phase: 'importing' | 'complete' | 'error'
+  message: string
+  parsed: number
+  inserted: number
+  skipped: number
+  instrument: string
+  timeframe: string
+}
+
 // Singleton socket manager — connects lazily on first use.
 let socket: Socket | null = null
 
 export function useCollectorSocket(
   onProgress: (p: IngestProgress) => void,
-  onEvalProgress?: (p: EvalProgress) => void
+  onEvalProgress?: (p: EvalProgress) => void,
+  onImportProgress?: (p: ImportProgress) => void
 ) {
   const cbRef = React.useRef(onProgress)
   const evalCbRef = React.useRef(onEvalProgress)
+  const importCbRef = React.useRef(onImportProgress)
   React.useEffect(() => {
     cbRef.current = onProgress
     evalCbRef.current = onEvalProgress
+    importCbRef.current = onImportProgress
   })
 
   React.useEffect(() => {
@@ -138,15 +152,26 @@ export function useCollectorSocket(
     }
     const handler = (p: IngestProgress) => cbRef.current(p)
     const evalHandler = (p: EvalProgress) => evalCbRef.current?.(p)
+    const importHandler = (p: ImportProgress) => importCbRef.current?.(p)
     socket.on('ingest:progress', handler)
     socket.on('ingest:complete', handler)
     socket.on('ingest:error', handler)
     socket.on('evaluate:progress', evalHandler)
+    socket.on('import:progress', importHandler)
     return () => {
       socket?.off('ingest:progress', handler)
       socket?.off('ingest:complete', handler)
       socket?.off('ingest:error', handler)
       socket?.off('evaluate:progress', evalHandler)
+      socket?.off('import:progress', importHandler)
     }
   }, [])
+}
+
+/**
+ * Get the raw socket instance (for ad-hoc event listeners).
+ * Returns null if the socket hasn't been initialized yet.
+ */
+export function getCollectorSocket(): Socket | null {
+  return socket
 }
