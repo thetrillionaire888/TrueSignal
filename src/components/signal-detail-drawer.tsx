@@ -208,7 +208,20 @@ export function SignalDetailDrawer() {
                 <Field label="Instrument" value={data.instrument} />
                 <Field label="Type" value={data.instrumentType} />
                 <Field label="Action" value={<ActionBadge action={data.action} />} />
-                <Field label="Timeframe" value={data.timeframe ?? '—'} />
+                {/* Signal TF = the trader's stated timeframe from the signal message
+                    (e.g. "15m", "scalping", "positional"). May be null if the parser
+                    couldn't extract it. Only shown when present. */}
+                {data.timeframe && <Field label="Signal TF" value={data.timeframe} />}
+                {/* Eval TF = the actual bar timeframe used by the evaluator (M1 or M15).
+                    Extracted from marketDataSource (e.g. "dukascopy-m1" → "M1").
+                    More meaningful than the signal's stated timeframe since it
+                    reflects the actual data resolution used for evaluation. */}
+                {data.evaluation?.marketDataSource && (
+                  <Field
+                    label="Eval TF"
+                    value={data.evaluation.marketDataSource.split('-').pop()?.toUpperCase() ?? '—'}
+                  />
+                )}
                 <Field
                   label="Entry"
                   value={data.isRange && data.entryLow != null && data.entryHigh != null
@@ -217,8 +230,11 @@ export function SignalDetailDrawer() {
                   mono
                 />
                 <Field label="Stop Loss" value={fmtPrice(data.stopLoss)} mono tone="negative" />
-                <Field label="Leverage" value={data.leverage ?? '—'} />
-                <Field label="Position" value={data.positionSize ?? '—'} />
+                {/* Leverage & Position — only shown when the parser extracted them.
+                    ~5% of signals don't have these fields; showing empty "—" cells
+                    for every signal made the Parsed Signal grid look incomplete. */}
+                {data.leverage && <Field label="Leverage" value={data.leverage} />}
+                {data.positionSize && <Field label="Position" value={data.positionSize} />}
               </div>
 
               {/* Price ladder visualization */}
