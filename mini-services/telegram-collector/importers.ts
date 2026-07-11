@@ -16,8 +16,20 @@ export async function fetchBinance(
     h1: "1h", h4: "4h", d1: "1d",
   };
   const bi = binanceInterval[interval] ?? interval;
+
+  // Binance requires symbols with quote currency (e.g. BTCUSDT, not BTCUSD).
+  // If the user enters "BTCUSD" or "btcusd", append "T" to make "BTCUSDT".
+  let binanceSymbol = symbol.toUpperCase();
+  if (!binanceSymbol.endsWith("USDT") && !binanceSymbol.endsWith("BUSD") && !binanceSymbol.endsWith("USDC")) {
+    if (binanceSymbol.endsWith("USD")) {
+      binanceSymbol = binanceSymbol + "T"; // BTCUSD → BTCUSDT
+    } else {
+      binanceSymbol = binanceSymbol + "USDT"; // BTC → BTCUSDT
+    }
+  }
+
   const url = new URL("https://api.binance.com/api/v3/klines");
-  url.searchParams.set("symbol", symbol.toUpperCase());
+  url.searchParams.set("symbol", binanceSymbol);
   url.searchParams.set("interval", bi);
   url.searchParams.set("startTime", String(startTime.getTime()));
   url.searchParams.set("endTime", String(endTime.getTime()));
@@ -194,7 +206,15 @@ export async function importFromSource(
     case "dukascopy": {
       const { fetchBarsCached } = await import("./bar-cache");
       const result = await fetchBarsCached(instrument, timeframe, startTime, endTime);
-      // fetchBarsCached already stores bars — return stats
+      // fetchBarsCached catches errors internally and returns empty bars.
+      // If we got 0 bars AND 0 fetched, it means the fetch failed.
+      if (result.bars.length === 0 && result.stats.fetched === 0 && result.stats.cached === 0) {
+        throw new Error(
+          `Dukascopy fetch returned no bars for ${instrument}. ` +
+          `The API may be rate-limiting or the date range has no data. ` +
+          `Try again later or use a different data source.`
+        );
+      }
       return {
         bars: result.bars,
         inserted: result.stats.fetched,

@@ -191,7 +191,12 @@ export async function fetchBarsCached(
         binanceUrl.searchParams.set("endTime", String(toMs));
         binanceUrl.searchParams.set("limit", "1000");
 
-        const binanceRes = await fetch(binanceUrl.toString());
+        // Wrap Binance fetch in a 10s timeout too (same TLS hang issue)
+        const binanceFetchPromise = fetch(binanceUrl.toString());
+        const binanceTimeoutPromise = new Promise<Response>((_, reject) =>
+          setTimeout(() => reject(new Error("Binance fetch timed out after 10s")), 10000)
+        );
+        const binanceRes = await Promise.race([binanceFetchPromise, binanceTimeoutPromise]);
         if (binanceRes.ok) {
           const binanceData = (await binanceRes.json()) as unknown[][];
           fetched = binanceData.map((row) => [
