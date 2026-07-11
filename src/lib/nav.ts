@@ -24,5 +24,5 @@ export const NAV: NavItem[] = [
   { id: 'analytics', label: 'Analytics', icon: BarChart3, desc: 'Deep metrics' },
   { id: 'ingest', label: 'Ingest', icon: Radar, desc: 'Telegram MTProto collector' },
   { id: 'pipeline', label: 'Pipeline', icon: Workflow, desc: 'Ingestion & parsing' },
-  { id: 'data-manager', label: 'Data Manager', icon: DatabaseZap, desc: 'Import, export & analyze data' },
+  { id: 'data-manager', label: 'Data Manager', icon: DatabaseZap, desc: 'Fetch, export & analyze data' },
 ]

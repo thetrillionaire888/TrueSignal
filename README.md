@@ -4,7 +4,7 @@
 
 TrueSignal is a signal audit platform that scrutinizes trading signals — starting with Telegram — and evaluates them against historical market data to reveal their true performance and reliability.
 
-Born from the SignalAudit engine, TrueSignal serves as a beacon of transparency in a world where trading signal claims often go unchecked. By connecting directly to Telegram via MTProto, parsing signals into structured data, and backtesting them against real OHLC bars from Dukascopy, Binance, and Yahoo Finance, TrueSignal exposes whether signals actually work — not just whether they sound good.
+Born from the TrueSignal engine, TrueSignal serves as a beacon of transparency in a world where trading signal claims often go unchecked. By connecting directly to Telegram via MTProto, parsing signals into structured data, and backtesting them against real OHLC bars from Dukascopy, Binance, and Yahoo Finance, TrueSignal exposes whether signals actually work — not just whether they sound good.
 
 ---
 

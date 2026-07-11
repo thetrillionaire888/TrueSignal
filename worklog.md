@@ -321,3 +321,153 @@ Work Log:
 
 Stage Summary:
 - dedupHash simplified to channelId|postedAt. Two-field concatenation instead of eight-field composite. Faster to compute, same dedup effectiveness for re-ingestion scenarios.
+
+---
+Task ID: 2-collector
+Agent: general-purpose sub-agent
+Task: Rewrite all 5 collector files in mini-services/telegram-collector/ to use the shared `@/lib/db` connection (replacing per-file `new Database(DB_PATH)` calls) after the Prisma→Drizzle 3-DB refactor.
+
+Work Log:
+- Read worklog, src/lib/db.ts (shared runtime-aware connection layer: bun:sqlite under Bun, better-sqlite3 under Node.js; ATTACH'd with catalog.db + market.db), and all 3 Drizzle schemas (audit: Message/Signal/Evaluation; catalog: Channel/ChannelStats/IngestState; market: PriceBar). Read all 5 collector files to understand the existing structure.
+- Confirmed `$`-prefixed named params (e.g. `$telegramId`) are supported in both bun:sqlite and better-sqlite3 with `{$name: value}` JS object syntax → safe for cross-runtime.
+
+- **db.ts (collector DB ops)**: Replaced `import { Database } from "bun:sqlite"` + `new Database(DB_PATH)` + PRAGMAs + DB_PATH resolution with `import { sqlite } from "@/lib/db"`. Split Channel handling into catalog.Channel (static identity: id, telegramId, name, type, category, description, avatarColor, language, region, verified, monitoredSince, createdAt) and catalog.ChannelStats (volatile counters: subscriberCount, lastMessageAt, messageCount, signalCount, status, updatedAt). `upsertChannel()` now: (1) looks up catalog.Channel by telegramId; (2) if found, updates only catalog.ChannelStats.subscriberCount/lastMessageAt (static fields immutable post-creation); (3) if new, inserts into BOTH catalog.Channel + catalog.ChannelStats inside a single `sqlite.transaction()` (atomic cross-DB write, both attached DBs in one tx). Added `incrementMessageCount` and `incrementSignalCount` prepared statements on catalog.ChannelStats. `insertMessage()` now bumps ChannelStats.messageCount (+lastMessageAt) after a successful Message insert. `insertSignal()` (INSERT OR IGNORE on dedupHash) bumps ChannelStats.signalCount only when `result.changes > 0` (i.e. not a duplicate). All counter bumps are best-effort (try/catch) so schema drift doesn't break ingestion. `getChannelStats()` and `getRecentMessages()` kept as COUNT(*)/SELECT against audit.Message (unchanged behavior, just running on the shared connection).
+
+- **bar-cache.ts**: Replaced `new Database(DB_PATH)` with `import { sqlite } from "@/lib/db"`. All 6 prepared statements rewritten with `market.PriceBar` prefix (the attached market.db alias). Removed the `cuid` import and the `$id` param from `insertBar` (the new PriceBar schema uses a composite PK of source+instrument+timeframe+timestamp — no `id` column). Added `batchInsertBars(source, instrument, timeframe, bars)` helper that wraps the per-bar INSERT OR IGNORE loop in a single `sqlite.transaction()` for amortized COMMIT cost. Both `fetchBarsCached()` (Dukascopy path) and `importBars()` (generic source path) now batch-insert via the helper. Verified with smoke test: 3 bars → {inserted: 3, skipped: 0}.
+
+- **evaluator.ts**: Replaced `new Database(DB_PATH)` with `import { sqlite } from "@/lib/db"`. Signal/Message/Evaluation queries use no prefix (audit.db is the main DB). Added `parseDbDate(s)` helper: returns epoch millis from either a pure-digit string (epoch-ms) or an ISO 8601 string; returns NaN on garbage (caller treats NaN as "now"). Used in evaluateSignal for `durationMinutes` computation (was previously `new Date(signal.postedAt).getTime()` which broke on epoch-ms strings). Added `notes: string | null` to SignalRow type and both `getUnevaluatedSignals` + `getUnevaluatedByChannel` SELECTs. Added `extractEntryType(notes)` helper that parses `entryType:stop|limit|market|range` from notes (defaults to "market" = immediate fill). Rewrote `evaluateSignal()` entry-fill logic to dispatch on entryType: (a) market → fill at first bar's open; (b) limit → buy when bar.low ≤ entry, sell when bar.high ≥ entry; (c) stop → buy when bar.high ≥ entry, sell when bar.low ≤ entry; (d) range → existing conservative-fill-at-edge-closest-to-SL logic (preserved verbatim). Each non-market entry type returns `sl_before_entry` invalid if SL hits before the entry triggers, and `<type>_not_triggered` if the entry never fills in the 48h window. Replaced the sequential for-loop in `evaluateSignals()` with a parallel 4-worker design: signals are round-robin partitioned across NUM_WORKERS=4 queues, each worker runs `runWorker()` which iterates its slice, calls `fetchBars` (async I/O → yields to event loop → other workers progress), evaluates, and accumulates results in a local buffer; when the buffer reaches BATCH_SIZE=25 it calls `saveEvaluationBatch()` which wraps all 25 inserts in a single `sqlite.transaction()`. Final partial batch flushed at end of each worker. After `Promise.all(workers)`, results are aggregated and the summary emitted. Preserved the original `getEvalStats()` + countEvaluatedByChannel/countTotalSignalsByChannel prepared statements (including the inert `EVAL_CHANNEL_FILTER` ternary that was in the original code). Added `saveEvaluationBatch()` alongside the existing single-row `saveEvaluation()`.
+
+- **ingestion-state.ts**: Replaced `new Database(DB_PATH)` + PRAGMAs with `import { sqlite } from "@/lib/db"`. Removed the `db.exec("CREATE TABLE IF NOT EXISTS IngestState...")` line entirely (IngestState is now created by Drizzle schema push on catalog.db). All 3 prepared statements rewritten with `catalog.IngestState` prefix. All other logic (in-memory control flags, startJob/updateProgress/pauseJob/resumeJob/stopJob/finishJob/checkControlSignal, getIngestionStatus, getResumePosition, clearResumePosition) preserved verbatim — just running on the shared connection. Verified with smoke test: startJob → updateProgress(100, 50, 5, 12345) → getResumePosition returns {offsetId: 12345, fetchedCount: 100}; clearResumePosition → null.
+
+- **index.ts (HTTP API + Socket.IO)**: Added `import { sqlite } from "@/lib/db"` at the top. In `/api/export-bars` endpoint, replaced the inline `const { Database } = await import("bun:sqlite")` + `const dbPath = resolve(import.meta.dir, "../../db/custom.db")` + `const exportDb = new Database(dbPath)` + `exportDb.exec("PRAGMA busy_timeout = 5000;")` + `exportDb.close()` lines with usage of the shared `sqlite` connection. Changed `FROM PriceBar` to `FROM market.PriceBar` in the export query. All other endpoints (auth, resolve-channel, ingest, channel-stats, evaluate, eval-stats, import, cache-summary, ingest control, health) and the socket.io setup and ingestAsync worker preserved verbatim. Verified end-to-end via curl: GET /api/export-bars?format=json&instrument=SMOKE&source=smoketest returned the 3 bars I had inserted via importBars().
+
+- Verified all 5 files compile with `bunx tsc --noEmit` — zero new TypeScript errors introduced (the only remaining errors are pre-existing: telegram.ts bigint issues, bun:sqlite missing under Node tsc which is by design, and unrelated chart/view files).
+- Started the collector service end-to-end with `bun run --bun index.ts` — it booted, connected to Telegram, and served all endpoints.
+- Cleaned up all smoke-test data (PriceBar rows with source="smoketest", Channel/ChannelStats rows from upsertChannel smoke tests) to leave the DB in its prior state.
+
+Stage Summary:
+- All 5 collector files now use the shared `sqlite` connection from `@/lib/db` — zero per-file `new Database()` calls remain in the collector service.
+- Channel identity is split: static fields in catalog.Channel (rare writes), volatile counters in catalog.ChannelStats (frequent writes). `upsertChannel()` is transactional across both tables.
+- Message/Signal inserts now maintain catalog.ChannelStats counters (messageCount, signalCount) in real-time, so the frontend can read live counts without re-running COUNT(*) queries.
+- All PriceBar queries use `market.PriceBar` prefix; batch inserts wrapped in a single transaction for ~25× COMMIT cost reduction.
+- Evaluator now supports 4 entry-fill models (market/limit/stop/range) via `entryType` tag in notes, runs as 4 parallel async workers with batched (25/batch) transactional writes, and tolerates both epoch-ms and ISO date strings in `postedAt`.
+- IngestState table is owned by the Drizzle schema (catalog.ts) — the collector no longer creates it at runtime.
+- Cross-runtime safety: every prepared statement uses `$`-prefixed named params + `{$name: value}` JS object syntax (works in both bun:sqlite and better-sqlite3).
+- `$`-prefixed named params are the contract for all collector DB access going forward.
+
+
+---
+Task ID: 5-metrics
+Agent: general-purpose sub-agent
+Task: Apply 8 fixes to the metrics engine in src/lib/metrics.ts and fix the byAction win rate in src/app/api/analytics/route.ts.
+
+Work Log:
+- Read worklog.md, src/lib/metrics.ts (314 lines), src/app/api/analytics/route.ts (94 lines) to understand current state.
+- Confirmed no test files exist for metrics — verified behavior with a one-off Bun smoke test instead.
+
+Fixes applied to src/lib/metrics.ts:
+
+- Fix 1 (CRITICAL — winRate excludes breakevens): Added `const decisive = wins.length + losses.length` before the return statement in computeMetrics. Changed `winRate: n ? wins.length / n : 0` → `winRate: decisive ? wins.length / decisive : 0`. Breakevens no longer dilute the win rate. (n is still used elsewhere for expectancy/variance/etc.)
+
+- Fix 2 (bestTrade/worstTrade unclamped): `bestTrade: round(Math.max(...rs, 0), 2)` → `bestTrade: round(rs.length ? Math.max(...rs) : 0, 2)`. Same pattern for worstTrade. Old code clamped all-loss portfolios to 0; new code reports the actual best/worst R. Empty array still returns 0 (avoids -Infinity).
+
+- Fix 3 (maxDrawdownPct meaningful): `maxDrawdownPct: round(maxDrawdown * 1.0, 2)` → `maxDrawdownPct: tradePeak > 0 ? round((maxDrawdown / tradePeak) * 100, 2) : round(maxDrawdown, 2)`. Uses the per-trade peak from Fix 8 to express drawdown as a percentage of the highest equity peak (in R units). Falls back to raw R when peak is 0.
+
+- Fix 4 (Dead code cleanup in buildEquityCurve): Removed `let cumR = 0`, `let cumPnl = 0`, `let peak = 0` from the first loop and the `peak = runPeak` assignment + `void peak` / `void cumR` / `void cumPnl` suppressions at the end. First loop now only populates byDay (its only job); second loop recomputes everything fresh.
+
+- Fix 5 (Distribution bucket labels): `'≤ -1R'` → `'< -1R'`, `'≥ +3R'` → `'> +3R'`. Labels now correctly match the bucket predicates `r.rMultiple > b.min && r.rMultiple <= b.max` (strict-less-than on the lower edge for the extreme buckets).
+
+- Fix 6 (Equity curve uses postedAt): In buildEquityCurve, changed sort from `a.evaluatedAt.getTime()` → `a.postedAt.getTime()` and day extraction from `r.evaluatedAt.toISOString()` → `r.postedAt.toISOString()`. Equity curve now reflects when signals were issued (postedAt) rather than when they were closed (evaluatedAt) — aligns with the per-trade drawdown calculation.
+
+- Fix 7 (Equity curve gap-filling): Added early-return `if (closed.length === 0) return []`. After building byDay, generate a complete daily date range from first to last signal day using a UTC cursor (`new Date(firstDay + 'T00:00:00Z')` → `setUTCDate(cursor.getUTCDate() + 1)`). Second loop now iterates `completeDays` instead of sparse `days`, using `byDay.get(day) ?? { r: 0, pnl: 0, trades: 0 }` for gap days. Frontend equity/drawdown charts now have continuous x-axis.
+
+- Fix 8 (CRITICAL — Max drawdown per-trade): Replaced the daily-aggregated equity-curve maxDD computation with a per-trade loop:
+    const sortedByPosted = [...closed].sort((a, b) => a.postedAt.getTime() - b.postedAt.getTime())
+    let tradePeak = 0, tradeMaxDD = 0, tradeCumR = 0
+    for (const r of sortedByPosted) {
+      tradeCumR += r.rMultiple
+      tradePeak = Math.max(tradePeak, tradeCumR)
+      tradeMaxDD = Math.min(tradeMaxDD, tradeCumR - tradePeak)
+    }
+    const maxDrawdown = Math.abs(tradeMaxDD)
+  Removed `const equity = buildEquityCurve(rows)` from computeMetrics (it was only used for the old maxDD calculation — buildEquityCurve is still called directly from analytics/route.ts for visualization). maxDrawdown now catches intra-day peaks that the daily aggregation would have hidden. `tradePeak` is reused by Fix 3 for maxDrawdownPct.
+
+Fix applied to src/app/api/analytics/route.ts:
+
+- byAction win rate breakeven bug: For both long and short, replaced `winRate: longs.length ? longs.filter((r) => r.outcome === 'win').length / longs.length : 0` with the decisive-trades pattern. Added `const longDecisive = longs.filter((r) => r.outcome === 'win' || r.outcome === 'loss').length` (and shortDecisive). Win rates now exclude breakevens from the denominator, matching the metrics engine fix.
+
+Verification:
+- TypeScript: `bunx tsc --noEmit` produces zero new errors in src/lib/metrics.ts or src/app/api/analytics/route.ts. (All remaining errors are pre-existing and unrelated: telegram.ts bigint issues, bun:sqlite missing under Node tsc by design, pre-existing chart/view type issues.)
+- Smoke test (Bun, /tmp/metrics-smoke.ts, deleted after run) verified all 8 fixes + analytics fix:
+  • Fix 1: 3 wins / 2 losses / 5 breakevens → winRate=0.6 (was 0.3 before fix). ✓
+  • Fix 2: all-loss portfolio [-1, -2, -0.5] → bestTrade=-0.5 (was 0 before), worstTrade=-2 (was -2, unchanged). Empty portfolio → 0/0. ✓
+  • Fix 3 + Fix 8: peak=5, drawdown=5 → maxDrawdown=5, maxDrawdownPct=100 (was 5 before fix). ✓
+  • Fix 5: First bucket label "< -1R", last "> +3R". ✓
+  • Fix 6 + Fix 7: Two signals on Jan 1 and Jan 5 → 5-point equity curve (Jan 1–5) with gap days Jan 2–4 emitted as zero-trade flat points. Empty input → []. ✓
+
+Stage Summary:
+- All 8 metrics-engine fixes + analytics-route byAction fix applied and verified. winRate now correctly excludes breakevens everywhere (computeMetrics + byAction). bestTrade/worstTrade no longer clamp all-loss portfolios to 0. maxDrawdown is computed per-trade (catches intra-day peaks) and maxDrawdownPct is a meaningful percentage of the equity peak (in R units). Equity curve uses postedAt (signal issue time) instead of evaluatedAt (close time), fills calendar gaps with zero-trade days, and returns [] for empty input. Distribution bucket labels match their predicates. Dead code (unused first-loop cumR/cumPnl/peak + void suppressions + redundant buildEquityCurve call in computeMetrics) removed. TypeScript clean for both files.
+
+---
+Task ID: 6-7-frontend
+Agent: general-purpose sub agent
+Task: Phase 6+7 — Apply 10 frontend fixes and 4 UI/UX improvements across multiple view components.
+
+Work Log:
+
+Phase 6 — Frontend Fixes:
+
+- Fix 1 (overview-view.tsx): Changed `data.channels.reduce((a, b) => a + 0, 0)` → `data.channels.length` so "sources monitored" reflects the actual channel count instead of always printing 0.
+- Fix 2 (overview-view.tsx): Removed the dead hidden `<div className="hidden"><button onClick={() => refetch()}>…</button></div>` block entirely and dropped the now-unused `isFetching` from the useQuery destructuring.
+- Fix 3 (overview-view.tsx): Added an `isError` short-circuit before the loading check that renders an `OverviewError` component (red AlertCircle + retry button calling `refetch()`). Imported `AlertCircle` from lucide-react.
+- Fix 4 (signals-view.tsx): Added a debounced search input. Local `searchInput` state, `useEffect` schedules a 300 ms `setTimeout` that calls `setFilter('q', searchInput)` only when the value actually differs from the current `filters.q`. The Input now binds to `searchInput`/`setSearchInput` instead of `filters.q` so typing no longer fires an API request per keystroke. (Used `searchInput` directly rather than `searchInput || null` to satisfy the `SignalFilters.q: string` type — empty string is treated as no filter by the API call's `if (filters.q) params.set(...)` guard.)
+- Fix 5 (signals-view.tsx): Added an empty-state row when `data && data.signals.length === 0` — shows a Search icon, "No signals found." message, and a "Clear all filters" button that calls `resetFilters()`. The row spans all 9 columns via `colSpan={9}`.
+- Fix 6 (signals-view.tsx): Changed `isRange: boolean` → `isRange: number` in the `SignalRow` type with a comment explaining SQLite stores it as 0/1 INTEGER. Updated the JSX to use `s.isRange ? (...)` (works because 0 is falsy, 1 is truthy). The list API (`/api/signals`) returns the raw SQLite integer via `queries.ts`, so this matches reality. The detail API (`/api/signals/[id]`) wraps with `Boolean(signal.isRange)` so `signal-detail-drawer.tsx` keeps its `boolean` typing.
+- Fix 7 (signal-detail-drawer.tsx): In `PriceLadder`, added `const uniqueTps = tps.filter((tp, i) => tps.indexOf(tp) === i)` and used `uniqueTps` everywhere `tps` was used (markers, labels, favorable-region calc). Also added a guard: `if (sl === entry) { return <div>Invalid signal: Stop loss equals entry price (zero risk)…</div> }` to short-circuit the divide-by-zero/NaN case with a clear error message instead of a broken ladder.
+- Fix 8 (signal-detail-drawer.tsx): In the pending-evaluation Section, added a centered `<a href="/?view=ingest">` button labelled "Go to Ingest to trigger evaluation" with an ArrowUpRight icon (already imported).
+- Fix 9 (channel-detail-drawer.tsx): Added a "View all {N} signals" button below the recent-signals list. onClick calls `closeChannel()`, then `useUI.getState().setFilter('channelId', data.channel.id)`, then `useUI.getState().setView('signals')` so the Signals view opens pre-filtered to this channel. Imported `ChevronRight` from lucide-react. `useUI` was already imported.
+- Fix 10 (channels-view.tsx): Replaced `MessageSquare` with `WifiCog` in the lucide-react import and in the signal-counter pill at the bottom of each channel card. Styled the pill with `bg-primary/10` + `text-primary` + `font-semibold` so it stands out as a primary-tinted badge.
+
+Phase 7 — UI/UX Improvements:
+
+- 7.1 (app-sidebar.tsx + ingest-view.tsx): Added a new `AuthStatusCard` component to the sidebar footer that:
+  • Polls `/api/status` (via `collectorFetch`, which auto-appends `?XTransformPort=3001`) every 30 s through `useQuery({ refetchInterval: 30_000 })`.
+  • When `state === 'authenticated'`: shows green `ShieldCheck` + user's `firstName lastName` + `@username` + a Logout button.
+  • When in an intermediate state (connected / code_sent / awaiting_2fa / loading): shows "Authenticating…" with a spinning `Loader2`.
+  • When disconnected / error: shows "Not authenticated" with a `ShieldAlert` icon and a "Go to Ingest" button that calls `setView('ingest')`.
+  • Logout button calls `collectorFetch('/api/auth/logout', { method: 'POST', json: {} })` (wrapped in try/catch) then `qc.invalidateQueries({ queryKey: ['collector-status'] })` so the sidebar + Ingest view both refresh.
+  Imports added to app-sidebar.tsx: `useQueryClient`, `ShieldCheck`, `ShieldAlert`, `Loader2`, `LogOut`, `ArrowUpRight`, `collectorFetch`, `SessionInfo`.
+  In ingest-view.tsx:
+  • Removed the `actions={<LogoutButton … />}` prop from the IngestionPanel's ChartCard.
+  • Removed the `LogoutButton` function entirely.
+  • Removed `LogOut` from the lucide-react import.
+  • The status banner is now wrapped in `{info?.state !== 'authenticated' && (...)}` so it only shows while NOT authenticated (the sidebar AuthStatusCard takes over once authenticated). The banner's `ShieldCheck` branch and the `info?.me ?` authenticated copy were removed accordingly.
+- 7.2 (ingest-view.tsx): In IngestionPanel, added:
+  • `const isPaused = !!progress?.paused`
+  • `const [stopClicked, setStopClicked] = React.useState(false)`
+  • A `useEffect` that resets `stopClicked` to false when `ingestMut.isPending` becomes true or `progress` becomes null (new ingestion / no progress).
+  • New `ingesting = (isLive && !isPaused && !stopClicked) || ingestMut.isPending`.
+  • Main Ingest button now renders: spinning `Loader2` + "Ingesting…" when `ingesting`; amber `Pause` + "Paused" when `isPaused`; rose `Square` + "Stopping…" when `stopClicked`; `Download` + the normal label when idle. Button is disabled when `ingesting || isPaused || stopClicked`. onClick also calls `setStopClicked(false)` to be safe.
+  • Stop button now sets `stopClicked(true)` immediately on click and is disabled by `disabled={stopClicked}` so it can't be double-clicked.
+  • Pause/Resume/Stop controls are now wrapped in `{isLive && !stopClicked && (...)}` so they hide entirely while the backend is winding down after Stop.
+- 7.3 (data-manager-view.tsx + nav.ts):
+  • Added `CloudDownload` to lucide-react imports.
+  • Renamed the first tab from "Import" to "Fetch" with a `CloudDownload` icon (was `Upload` + "Import").
+  • Changed all four API-source icons in the SOURCES array from `TrendingUp` to `CloudDownload` (CSV Upload keeps `Upload`).
+  • ChartCard title is now conditional: `Import from ${label}` for CSV, `Fetch from ${label}` for API sources.
+  • Submit button: icon is `Upload` for CSV / `CloudDownload` for API; label is `Import ${label} data` / `Fetch ${label} data`; pending label is `Importing…` / `Fetching…`.
+  • Success banner: `Import successful` for CSV / `Fetch successful` for API.
+  • The Analyze tab's "Data Sources" KPI still uses `TrendingUp` (it's a generic chart icon, not a source icon).
+  • Updated `src/lib/nav.ts`: Data Manager desc changed from "Import, export & analyze data" → "Fetch, export & analyze data".
+- 7.4 (data-manager-view.tsx): Restructured the API-source form grid so dates are in chronological order:
+  • Row 1 (`sm:grid-cols-2`): Instrument / Symbol | Timeframe
+  • Row 2 (`sm:grid-cols-2`): Start Date | End Date
+  (Was a 3-column row with Instrument | Timeframe | End Date followed by a full-width Start Date row — confusing because End Date appeared before Start Date.)
+
+Verification:
+- `bun run tsc --noEmit` produces zero new errors in any of the 8 touched files. The only file with errors in the touched set is `data-manager-view.tsx`, with 3 pre-existing `fmtDateTime` signature errors on `result.dateRange.from` (string|null) and `g.earliest`/`g.latest` (number) — confirmed pre-existing by git-stashing my changes and re-running tsc (same 3 errors at the pre-edit line numbers 346/632/633).
+- Lucide icon existence verified via `require('lucide-react')`: `WifiCog`, `CloudDownload`, `ShieldAlert`, `ArrowUpRight`, `ShieldCheck`, `LogOut`, `Loader2` all present.
+- All imports still used: `TrendingUp` retained in data-manager-view.tsx for the Analyze-tab "Data Sources" KPI; `ShieldCheck` retained in ingest-view.tsx for the 2FA unlock button + resolved-channel badge; `Download` retained for the Export tab and download buttons.
+
+Stage Summary:
+- All 10 Phase 6 frontend fixes and all 4 Phase 7 UI/UX improvements applied. Overview view shows the correct source count and gracefully handles fetch errors. Signals view debounces search, shows a friendly empty state, and types `isRange` as `number` to match SQLite's 0/1 storage. Signal detail drawer dedupes TPs, guards against SL==entry, and links to Ingest for pending evaluations. Channel detail drawer offers a "View all N signals" shortcut. Channels view uses a WifiCog primary-tinted pill for signal counts. Sidebar footer now shows live auth state with Logout, the Ingest view no longer duplicates the auth banner once authenticated, and the main Ingest button's spinner correctly reflects pause/stop/idle/ingesting states. Data Manager tab renamed to "Fetch" with CloudDownload icons for API sources while CSV upload retains "Import" terminology, and date fields are now in chronological order.

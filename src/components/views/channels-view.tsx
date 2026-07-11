@@ -7,7 +7,7 @@ import { OutcomeBadge } from '@/components/badges'
 import { useUI } from '@/lib/store'
 import { fmtPct, fmtInt, fmtCompact, fmtR, CATEGORY_META, timeAgo } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { Users, MessageSquare, TrendingUp, ArrowRight, ChevronRight } from 'lucide-react'
+import { Users, WifiCog, TrendingUp, ArrowRight, ChevronRight } from 'lucide-react'
 
 type ChannelRow = {
   id: string
@@ -148,8 +148,10 @@ export function ChannelsView() {
                   {fmtCompact(c.subscriberCount)}
                 </span>
                 <span className="flex items-center gap-1">
-                  <MessageSquare className="h-3 w-3" />
-                  {fmtInt(c.totalSignals)} sig
+                  <WifiCog className="h-3 w-3" />
+                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 font-semibold text-primary">
+                    {fmtInt(c.totalSignals)} sig
+                  </span>
                 </span>
                 <span className="flex items-center gap-1">
                   <TrendingUp className="h-3 w-3" />

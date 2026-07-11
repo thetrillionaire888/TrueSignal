@@ -39,18 +39,21 @@ export async function GET(req: Request) {
   const instruments = instrumentBreakdown(mapped)
   const equity = buildEquityCurve(mapped)
 
-  // outcome by action
+  // outcome by action — win rate computed over decisive trades (wins + losses)
+  // only; breakevens are excluded from the denominator.
   const longs = mapped.filter((r) => r.action === 'long')
   const shorts = mapped.filter((r) => r.action === 'short')
+  const longDecisive = longs.filter((r) => r.outcome === 'win' || r.outcome === 'loss').length
+  const shortDecisive = shorts.filter((r) => r.outcome === 'win' || r.outcome === 'loss').length
   const byAction = {
     long: {
       trades: longs.length,
-      winRate: longs.length ? longs.filter((r) => r.outcome === 'win').length / longs.length : 0,
+      winRate: longDecisive ? longs.filter((r) => r.outcome === 'win').length / longDecisive : 0,
       avgR: longs.length ? longs.reduce((a, b) => a + b.rMultiple, 0) / longs.length : 0,
     },
     short: {
       trades: shorts.length,
-      winRate: shorts.length ? shorts.filter((r) => r.outcome === 'win').length / shorts.length : 0,
+      winRate: shortDecisive ? shorts.filter((r) => r.outcome === 'win').length / shortDecisive : 0,
       avgR: shorts.length ? shorts.reduce((a, b) => a + b.rMultiple, 0) / shorts.length : 0,
     },
   }

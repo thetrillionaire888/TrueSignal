@@ -20,7 +20,8 @@ type SignalRow = {
   entryPrice: number
   entryLow: number | null
   entryHigh: number | null
-  isRange: boolean
+  // SQLite stores isRange as 0/1 (INTEGER), so we type it as number.
+  isRange: number
   stopLoss: number
   takeProfits: string
   leverage: string | null
@@ -48,6 +49,16 @@ type SignalsResp = { signals: SignalRow[]; total: number; page: number; pageSize
 export function SignalsView() {
   const { filters, setFilter, resetFilters, openSignal } = useUI()
   const [showFilters, setShowFilters] = React.useState(true)
+  const [searchInput, setSearchInput] = React.useState(filters.q ?? '')
+
+  React.useEffect(() => {
+    const t = setTimeout(() => {
+      if ((filters.q ?? '') !== searchInput) {
+        setFilter('q', searchInput)
+      }
+    }, 300)
+    return () => clearTimeout(t)
+  }, [searchInput])
 
   const params = new URLSearchParams({
     page: String(filters.page),
@@ -86,8 +97,8 @@ export function SignalsView() {
             <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               placeholder="Search instrument or message…"
-              value={filters.q}
-              onChange={(e) => setFilter('q', e.target.value)}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               className="pl-9"
             />
           </div>
@@ -215,6 +226,25 @@ export function SignalsView() {
                       ))}
                     </tr>
                   ))
+                : data && data.signals.length === 0 ? (
+                  <tr className="border-b border-border/40">
+                    <td colSpan={9} className="px-3 py-10 text-center">
+                      <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
+                        <Search className="h-6 w-6 opacity-40" />
+                        <span>No signals found.</span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={resetFilters}
+                          className="mt-1 gap-1.5"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          Clear all filters
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                )
                 : data?.signals.map((s) => (
                     <tr
                       key={s.id}
@@ -246,9 +276,9 @@ export function SignalsView() {
                         <ActionBadge action={s.action} />
                       </td>
                       <td className="px-3 py-2.5 text-right tnum text-muted-foreground">
-                        {s.isRange && s.entryLow != null && s.entryHigh != null ? (
+                        {s.isRange ? (
                           <span className="inline-flex flex-col items-end leading-tight">
-                            <span>{fmtPrice(s.entryLow)} – {fmtPrice(s.entryHigh)}</span>
+                            <span>{s.entryLow != null && s.entryHigh != null ? `${fmtPrice(s.entryLow)} – ${fmtPrice(s.entryHigh)}` : fmtPrice(s.entryPrice)}</span>
                             <span className="text-[9px] uppercase text-amber-500">range</span>
                           </span>
                         ) : (

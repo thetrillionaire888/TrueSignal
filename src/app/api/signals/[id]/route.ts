@@ -1,14 +1,11 @@
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { getSignalById } from '@/lib/queries'
 
 export const dynamic = 'force-dynamic'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
-  const signal = await db.signal.findUnique({
-    where: { id },
-    include: { evaluation: true, channel: true, message: true },
-  })
+  const signal = await getSignalById(id)
   if (!signal) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
   return NextResponse.json({
@@ -19,7 +16,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     entryPrice: signal.entryPrice,
     entryLow: signal.entryLow,
     entryHigh: signal.entryHigh,
-    isRange: signal.isRange,
+    isRange: Boolean(signal.isRange),
     stopLoss: signal.stopLoss,
     takeProfits: signal.takeProfits,
     positionSize: signal.positionSize,
@@ -31,42 +28,42 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     notes: signal.notes,
     parsedAt: signal.parsedAt,
     channel: {
-      id: signal.channel.id,
-      name: signal.channel.name,
-      telegramId: signal.channel.telegramId,
-      category: signal.channel.category,
-      type: signal.channel.type,
-      avatarColor: signal.channel.avatarColor,
-      subscriberCount: signal.channel.subscriberCount,
-      verified: signal.channel.verified,
+      id: signal.channelId,
+      name: signal.channelName,
+      telegramId: signal.telegramId,
+      category: signal.category,
+      type: signal.channelType,
+      avatarColor: signal.avatarColor,
+      subscriberCount: signal.subscriberCount,
+      verified: Boolean(signal.verified),
     },
     message: {
-      id: signal.message.id,
-      telegramMessageId: signal.message.telegramMessageId,
-      rawText: signal.message.rawText,
-      hasMedia: signal.message.hasMedia,
-      mediaType: signal.message.mediaType,
-      views: signal.message.views,
-      forwards: signal.message.forwards,
-      reactions: signal.message.reactions,
-      postedAt: signal.message.postedAt,
-      ingestedAt: signal.message.ingestedAt,
-      parseStatus: signal.message.parseStatus,
-      ingestSource: signal.message.ingestSource,
+      id: signal.messageId,
+      telegramMessageId: signal.telegramMessageId,
+      rawText: signal.rawText,
+      hasMedia: signal.hasMedia,
+      mediaType: signal.mediaType,
+      views: signal.views,
+      forwards: signal.forwards,
+      reactions: signal.reactions,
+      postedAt: signal.postedAt,
+      ingestedAt: signal.ingestedAt,
+      parseStatus: signal.parseStatus,
+      ingestSource: signal.ingestSource,
     },
-    evaluation: signal.evaluation
+    evaluation: signal.outcome
       ? {
-          outcome: signal.evaluation.outcome,
-          exitPrice: signal.evaluation.exitPrice,
-          exitReason: signal.evaluation.exitReason,
-          hitTpLevel: signal.evaluation.hitTpLevel,
-          maxFavorablePct: signal.evaluation.maxFavorablePct,
-          maxAdversePct: signal.evaluation.maxAdversePct,
-          rMultiple: signal.evaluation.rMultiple,
-          pnlPercent: signal.evaluation.pnlPercent,
-          durationMinutes: signal.evaluation.durationMinutes,
-          marketDataSource: signal.evaluation.marketDataSource,
-          evaluatedAt: signal.evaluation.evaluatedAt,
+          outcome: signal.outcome,
+          exitPrice: signal.exitPrice,
+          exitReason: signal.exitReason,
+          hitTpLevel: signal.hitTpLevel,
+          maxFavorablePct: signal.maxFavorablePct,
+          maxAdversePct: signal.maxAdversePct,
+          rMultiple: signal.rMultiple,
+          pnlPercent: signal.pnlPercent,
+          durationMinutes: signal.durationMinutes,
+          marketDataSource: signal.marketDataSource,
+          evaluatedAt: signal.evaluatedAt,
         }
       : null,
   })

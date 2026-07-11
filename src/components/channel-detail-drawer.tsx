@@ -10,7 +10,7 @@ import { ChartCard } from '@/components/charts/chart-card'
 import { EquityCurveChart, type EquityPoint } from '@/components/charts/equity-curve-chart'
 import { useUI } from '@/lib/store'
 import { fmtPct, fmtInt, fmtCompact, fmtR, fmtPrice, fmtDate, CATEGORY_META } from '@/lib/format'
-import { Users, MessageSquare, Target, Scale, Activity, ArrowDownRight, Gauge, Percent, ExternalLink } from 'lucide-react'
+import { Users, MessageSquare, Target, Scale, Activity, ArrowDownRight, Gauge, Percent, ExternalLink, ChevronRight } from 'lucide-react'
 
 type ChannelDetail = {
   channel: {
@@ -181,6 +181,19 @@ export function ChannelDetailDrawer() {
                     </span>
                   </button>
                 ))}
+              </div>
+              <div className="mt-3 flex justify-center border-t border-border/60 pt-3">
+                <button
+                  onClick={() => {
+                    closeChannel()
+                    useUI.getState().setFilter('channelId', data.channel.id)
+                    useUI.getState().setView('signals')
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                >
+                  View all {fmtInt(data.metrics.closedSignals)} signals
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
               </div>
             </ChartCard>
           </div>

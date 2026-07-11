@@ -1,36 +1,23 @@
 // Ingestion job state manager: tracks the active ingestion job and supports
-// pause / resume / stop control signals. Also persists resume position
-// (offsetId) per channel so ingestion can resume from where it left off.
-import { Database } from "bun:sqlite";
-import { resolve } from "node:path";
-
-const DB_PATH = resolve(import.meta.dir, "../../db/custom.db");
-const db = new Database(DB_PATH);
-db.exec("PRAGMA journal_mode = WAL;");
-db.exec("PRAGMA busy_timeout = 5000;");
-
-// Persist the last-fetched offsetId per channel so we can resume.
-db.exec(`
-  CREATE TABLE IF NOT EXISTS IngestState (
-    channelId     TEXT PRIMARY KEY,
-    offsetId      INTEGER NOT NULL,
-    fetchedCount  INTEGER NOT NULL DEFAULT 0,
-    updatedAt     TEXT NOT NULL DEFAULT (datetime('now'))
-  )
-`);
+// pause / resume / stop control signals. Persists resume position (offsetId)
+// per channel in `catalog.IngestState` so ingestion can resume from where it
+// left off.
+//
+// Uses the shared `sqlite` connection from `@/lib/db` (catalog.db is ATTACH'd
+// as `catalog`). The IngestState table is created by the Drizzle schema push
+// (src/lib/schema/catalog.ts → ingestState), so we don't CREATE TABLE here.
+// `$`-prefixed named params work in both bun:sqlite and better-sqlite3.
+import { sqlite } from "@/lib/db";
 
 const stmts = {
-  getIngestState: db.prepare<{ offsetId: number; fetchedCount: number }, { $channelId: string }>(
-    "SELECT offsetId, fetchedCount FROM IngestState WHERE channelId = $channelId"
+  getIngestState: sqlite.prepare(
+    "SELECT offsetId, fetchedCount FROM catalog.IngestState WHERE channelId = $channelId"
   ),
-  upsertIngestState: db.prepare<
-    unknown,
-    { $channelId: string; $offsetId: number; $fetchedCount: number }
-  >(
-    "INSERT INTO IngestState (channelId, offsetId, fetchedCount, updatedAt) VALUES ($channelId, $offsetId, $fetchedCount, datetime('now')) ON CONFLICT(channelId) DO UPDATE SET offsetId = $offsetId, fetchedCount = $fetchedCount, updatedAt = datetime('now')"
+  upsertIngestState: sqlite.prepare(
+    "INSERT INTO catalog.IngestState (channelId, offsetId, fetchedCount, updatedAt) VALUES ($channelId, $offsetId, $fetchedCount, datetime('now')) ON CONFLICT(channelId) DO UPDATE SET offsetId = $offsetId, fetchedCount = $fetchedCount, updatedAt = datetime('now')"
   ),
-  clearIngestState: db.prepare<unknown, { $channelId: string }>(
-    "DELETE FROM IngestState WHERE channelId = $channelId"
+  clearIngestState: sqlite.prepare(
+    "DELETE FROM catalog.IngestState WHERE channelId = $channelId"
   ),
 };
 
@@ -154,7 +141,9 @@ export function finishJob() {
 }
 
 export function getResumePosition(channelId: string): { offsetId: number; fetchedCount: number } | null {
-  const row = stmts.getIngestState.get({ $channelId: channelId });
+  const row = stmts.getIngestState.get({ $channelId: channelId }) as
+    | { offsetId: number; fetchedCount: number }
+    | null;
   if (!row) return null;
   return { offsetId: row.offsetId, fetchedCount: row.fetchedCount };
 }

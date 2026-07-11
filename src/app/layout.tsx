@@ -15,11 +15,11 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SignalAudit — Telegram Trading Signal Analytics",
+  title: "TrueSignal — Telegram Trading Signal Analytics",
   description:
     "Audit Telegram trading channels. Parse signals, evaluate outcomes against market data, and compute performance metrics — win rate, risk/reward, Sharpe & Calmar ratios.",
   keywords: ["Telegram", "trading signals", "analytics", "win rate", "Sharpe", "Calmar", "audit"],
-  authors: [{ name: "SignalAudit" }],
+  authors: [{ name: "TrueSignal" }],
 };
 
 export default function RootLayout({

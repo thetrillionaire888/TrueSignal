@@ -269,6 +269,15 @@ export function SignalDetailDrawer() {
                 <p className="py-4 text-center text-sm text-muted-foreground">
                   This signal is still being evaluated against market data.
                 </p>
+                <div className="flex justify-center pb-2">
+                  <a
+                    href="/?view=ingest"
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                  >
+                    <ArrowUpRight className="h-3.5 w-3.5" />
+                    Go to Ingest to trigger evaluation
+                  </a>
+                </div>
               </Section>
             )}
           </div>
@@ -349,8 +358,23 @@ function PriceLadder({
   hitTp: number | null
   outcome: string
 }) {
+  // De-duplicate take-profit levels — parsers occasionally emit the same TP twice.
+  const uniqueTps = tps.filter((tp, i) => tps.indexOf(tp) === i)
+
+  // Guard: if SL equals entry price, the signal has zero risk and the ladder
+  // math (range, position offsets) breaks down with divide-by-zero / NaN.
+  if (sl === entry) {
+    return (
+      <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-500/5 p-3 text-xs text-rose-600 dark:text-rose-400">
+        <strong>Invalid signal:</strong> Stop loss equals entry price (zero risk).
+        The price ladder cannot be rendered. This signal will be flagged as
+        invalid during evaluation.
+      </div>
+    )
+  }
+
   const isLong = action === 'long'
-  const allLevels = [sl, entry, ...tps, ...(exit != null ? [exit] : [])]
+  const allLevels = [sl, entry, ...uniqueTps, ...(exit != null ? [exit] : [])]
   const min = Math.min(...allLevels)
   const max = Math.max(...allLevels)
   const range = max - min || 1
@@ -377,8 +401,8 @@ function PriceLadder({
         <div
           className={cn('absolute inset-y-3', isLong ? 'bg-emerald-500/10' : 'bg-emerald-500/10')}
           style={{
-            left: `${Math.min(pos(entry), pos(tps[tps.length - 1] ?? entry))}%`,
-            width: `${Math.abs(pos(tps[tps.length - 1] ?? entry) - pos(entry))}%`,
+            left: `${Math.min(pos(entry), pos(uniqueTps[uniqueTps.length - 1] ?? entry))}%`,
+            width: `${Math.abs(pos(uniqueTps[uniqueTps.length - 1] ?? entry) - pos(entry))}%`,
           }}
         />
         {/* adverse region */}
@@ -390,7 +414,7 @@ function PriceLadder({
           }}
         />
         {/* TP markers */}
-        {tps.map((tp, i) => (
+        {uniqueTps.map((tp, i) => (
           <div
             key={i}
             className="absolute inset-y-3 w-px bg-emerald-500/70"
@@ -414,7 +438,7 @@ function PriceLadder({
         <LadderLabel x={pos(entry)} align="center" color="text-foreground">
           Entry {fmtPrice(entry)}
         </LadderLabel>
-        {tps.map((tp, i) => (
+        {uniqueTps.map((tp, i) => (
           <LadderLabel key={i} x={pos(tp)} align="right" color={hitTp === i + 1 ? 'text-emerald-600 dark:text-emerald-400' : 'text-emerald-500/80'}>
             TP{i + 1} {fmtPrice(tp)}
           </LadderLabel>

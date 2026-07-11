@@ -1,15 +1,15 @@
 // Read-through cache for Dukascopy OHLC bars.
-// Checks SQLite first, fetches only missing time ranges from Dukascopy,
-// and stores the fetched bars for future reuse.
+// Checks SQLite first (market.PriceBar — attached market.db), fetches only
+// missing time ranges from Dukascopy, and stores the fetched bars for future
+// reuse. Uses the shared `sqlite` connection from `@/lib/db`.
+//
+// Notes:
+//   - All PriceBar queries use the `market.PriceBar` prefix because the
+//     bars live in the attached market.db.
+//   - Batch-inserts bars in a single transaction to amortize COMMIT cost.
+//   - `$`-prefixed named params work in both bun:sqlite and better-sqlite3.
 import { getHistoricalRates } from "dukascopy-node";
-import { Database } from "bun:sqlite";
-import { resolve } from "node:path";
-import { cuid } from "./cuid";
-
-const DB_PATH = resolve(import.meta.dir, "../../db/custom.db");
-const db = new Database(DB_PATH);
-db.exec("PRAGMA journal_mode = WAL;");
-db.exec("PRAGMA busy_timeout = 5000;");
+import { sqlite } from "@/lib/db";
 
 // 15-minute bar = 900000 ms
 const BAR_INTERVALS: Record<string, number> = {
@@ -23,29 +23,22 @@ const BAR_INTERVALS: Record<string, number> = {
 };
 
 const stmts = {
-  getCachedRange: db.prepare<
-    { timestamp: number; open: number; high: number; low: number; close: number; volume: number },
-    { $instrument: string; $timeframe: string; $from: number; $to: number }
-  >(
-    "SELECT timestamp, open, high, low, close, volume FROM PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to ORDER BY timestamp ASC"
+  getCachedRange: sqlite.prepare(
+    "SELECT timestamp, open, high, low, close, volume FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to ORDER BY timestamp ASC"
   ),
-  countCachedRange: db.prepare<{ c: number }, { $instrument: string; $timeframe: string; $from: number; $to: number }>(
-    "SELECT COUNT(*) as c FROM PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to"
+  countCachedRange: sqlite.prepare(
+    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to"
   ),
-  insertBar: db.prepare<
-    unknown,
-    { $id: string; $source: string; $instrument: string; $timeframe: string; $timestamp: number; $open: number; $high: number; $low: number; $close: number; $volume: number }
-  >(
-    "INSERT OR IGNORE INTO PriceBar (id, source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt) VALUES ($id, $source, $instrument, $timeframe, $timestamp, $open, $high, $low, $close, $volume, datetime('now'))"
+  insertBar: sqlite.prepare(
+    "INSERT OR IGNORE INTO market.PriceBar (source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt) VALUES ($source, $instrument, $timeframe, $timestamp, $open, $high, $low, $close, $volume, datetime('now'))"
   ),
-  totalCached: db.prepare<{ c: number }, { $instrument: string; $timeframe: string }>(
-    "SELECT COUNT(*) as c FROM PriceBar WHERE instrument = $instrument AND timeframe = $timeframe"
+  totalCached: sqlite.prepare(
+    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe"
   ),
-  cacheSummary: db.prepare<
-    { source: string; instrument: string; c: number; earliest: number; latest: number },
-    Record<string, never>
-  >("SELECT source, instrument, COUNT(*) as c, MIN(timestamp) as earliest, MAX(timestamp) as latest FROM PriceBar GROUP BY source, instrument ORDER BY source, instrument"),
-  totalBars: db.prepare<{ c: number }, Record<string, never>>("SELECT COUNT(*) as c FROM PriceBar"),
+  cacheSummary: sqlite.prepare(
+    "SELECT source, instrument, COUNT(*) as c, MIN(timestamp) as earliest, MAX(timestamp) as latest FROM market.PriceBar GROUP BY source, instrument ORDER BY source, instrument"
+  ),
+  totalBars: sqlite.prepare("SELECT COUNT(*) as c FROM market.PriceBar"),
 };
 
 export type Bar = {
@@ -64,6 +57,42 @@ export type CacheStats = {
 };
 
 /**
+ * Batch-insert bars in a single transaction. Each insert uses INSERT OR IGNORE
+ * so duplicates (same source+instrument+timeframe+timestamp PK) are silently
+ * skipped. Returns the count of bars actually inserted (changes > 0).
+ */
+function batchInsertBars(
+  source: string,
+  instrument: string,
+  timeframe: string,
+  bars: Bar[]
+): { inserted: number; skipped: number } {
+  let inserted = 0;
+  let skipped = 0;
+  if (bars.length === 0) return { inserted, skipped };
+
+  const tx = sqlite.transaction(() => {
+    for (const bar of bars) {
+      const result = stmts.insertBar.run({
+        $source: source,
+        $instrument: instrument,
+        $timeframe: timeframe,
+        $timestamp: bar.timestamp,
+        $open: bar.open,
+        $high: bar.high,
+        $low: bar.low,
+        $close: bar.close,
+        $volume: bar.volume,
+      }) as { changes: number };
+      if (result.changes > 0) inserted++;
+      else skipped++;
+    }
+  });
+  tx();
+  return { inserted, skipped };
+}
+
+/**
  * Fetch OHLC bars with read-through caching.
  * Returns bars for [fromTime, toTime) at the given timeframe.
  * Checks the DB cache first; only fetches missing bars from Dukascopy.
@@ -78,6 +107,7 @@ export async function fetchBarsCached(
   const fromMs = fromTime.getTime();
   const toMs = toTime.getTime();
   const interval = BAR_INTERVALS[timeframe] ?? 900_000;
+  void interval; // reserved for future gap-detection
 
   // Check what we already have cached for this exact time range
   const cachedCount = (stmts.countCachedRange.get({
@@ -92,21 +122,21 @@ export async function fetchBarsCached(
   // actual count is always lower than the theoretical max. We treat any
   // non-zero cached count as a hit (the data was already fetched).
   if (cachedCount > 0) {
-    const cachedBars = stmts.getCachedRange
-      .all({
-        $instrument: instrument,
-        $timeframe: timeframe,
-        $from: fromMs,
-        $to: toMs,
-      })
-      .map((r) => ({
+    const cachedBars = (stmts.getCachedRange.all({
+      $instrument: instrument,
+      $timeframe: timeframe,
+      $from: fromMs,
+      $to: toMs,
+    }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
+      (r) => ({
         timestamp: r.timestamp,
         open: r.open,
         high: r.high,
         low: r.low,
         close: r.close,
         volume: r.volume,
-      }));
+      })
+    );
     onProgress?.(`cache hit: ${cachedBars.length} bars for ${instrument.toUpperCase()}`);
     return {
       bars: cachedBars,
@@ -119,7 +149,7 @@ export async function fetchBarsCached(
   let fetched: unknown[] = [];
   try {
     fetched = (await getHistoricalRates({
-      instrument,
+      instrument: instrument as unknown as never,
       dates: { from: fromTime, to: toTime },
       timeframe: timeframe as unknown as never,
       format: "array" as unknown as never,
@@ -131,85 +161,74 @@ export async function fetchBarsCached(
       e instanceof Error ? e.message : String(e)
     );
     // Fall back to whatever we have cached
-    const cachedBars = stmts.getCachedRange
-      .all({
-        $instrument: instrument,
-        $timeframe: timeframe,
-        $from: fromMs,
-        $to: toMs,
-      })
-      .map((r) => ({
+    const cachedBars = (stmts.getCachedRange.all({
+      $instrument: instrument,
+      $timeframe: timeframe,
+      $from: fromMs,
+      $to: toMs,
+    }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
+      (r) => ({
         timestamp: r.timestamp,
         open: r.open,
         high: r.high,
         low: r.low,
         close: r.close,
         volume: r.volume,
-      }));
+      })
+    );
     return {
       bars: cachedBars,
       stats: { cached: cachedBars.length, fetched: 0, total: cachedBars.length },
     };
   }
 
-  // Store fetched bars in the cache (insert OR IGNORE for idempotency)
-  const bars: Bar[] = [];
+  // Store fetched bars in the cache (batch-insert in a single transaction).
+  const fetchedBars: Bar[] = [];
   for (const row of fetched) {
     const r = row as unknown[];
-    const bar: Bar = {
+    fetchedBars.push({
       timestamp: Number(r[0]),
       open: Number(r[1]),
       high: Number(r[2]),
       low: Number(r[3]),
       close: Number(r[4]),
       volume: Number(r[5] ?? 0),
-    };
-    bars.push(bar);
-    try {
-      stmts.insertBar.run({
-        $id: cuid(),
-        $source: "dukascopy",
-        $instrument: instrument,
-        $timeframe: timeframe,
-        $timestamp: bar.timestamp,
-        $open: bar.open,
-        $high: bar.high,
-        $low: bar.low,
-        $close: bar.close,
-        $volume: bar.volume,
-      });
-    } catch {
-      // INSERT OR IGNORE handles duplicates
-    }
+    });
+  }
+  // Batch-insert in one transaction for amortized COMMIT cost.
+  try {
+    batchInsertBars("dukascopy", instrument, timeframe, fetchedBars);
+  } catch {
+    // INSERT OR IGNORE handles duplicates inside the transaction
   }
 
   // Merge cached + newly fetched (dedup by timestamp)
-  const cachedBars = stmts.getCachedRange
-    .all({
-      $instrument: instrument,
-      $timeframe: timeframe,
-      $from: fromMs,
-      $to: toMs,
-    })
-    .map((r) => ({
+  const cachedBars = (stmts.getCachedRange.all({
+    $instrument: instrument,
+    $timeframe: timeframe,
+    $from: fromMs,
+    $to: toMs,
+  }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
+    (r) => ({
       timestamp: r.timestamp,
       open: r.open,
       high: r.high,
       low: r.low,
       close: r.close,
       volume: r.volume,
-    }));
+    })
+  );
 
   const allBars = new Map<number, Bar>();
   for (const b of cachedBars) allBars.set(b.timestamp, b);
-  for (const b of bars) allBars.set(b.timestamp, b);
+  for (const b of fetchedBars) allBars.set(b.timestamp, b);
   const merged = Array.from(allBars.values()).sort((a, b) => a.timestamp - b.timestamp);
 
   return {
     bars: merged,
     stats: {
       cached: cachedBars.length,
-      fetched: bars.length,
+      fetched: fetchedBars.length,
       total: merged.length,
     },
   };
@@ -220,41 +239,26 @@ export function getCacheStats(instrument: string, timeframe: string): number {
 }
 
 // ── Generic bar import (for non-Dukascopy sources) ──────────────────────────
+// Batch-inserts bars in a single transaction for efficiency.
 export function importBars(
   source: string,
   instrument: string,
   timeframe: string,
   bars: Bar[]
 ): { inserted: number; skipped: number } {
-  let inserted = 0;
-  let skipped = 0;
-  for (const bar of bars) {
-    try {
-      const result = stmts.insertBar.run({
-        $id: cuid(),
-        $source: source,
-        $instrument: instrument,
-        $timeframe: timeframe,
-        $timestamp: bar.timestamp,
-        $open: bar.open,
-        $high: bar.high,
-        $low: bar.low,
-        $close: bar.close,
-        $volume: bar.volume,
-      });
-      if (result.changes > 0) inserted++;
-      else skipped++;
-    } catch {
-      skipped++;
-    }
-  }
-  return { inserted, skipped };
+  return batchInsertBars(source, instrument, timeframe, bars);
 }
 
 // ── Cache summary for the Data Manager UI ───────────────────────────────────
 export function getCacheSummary() {
-  const total = (stmts.totalBars.get({} as Record<string, never>) as { c: number }).c;
-  const bySource = stmts.cacheSummary.all({} as Record<string, never>);
+  const total = (stmts.totalBars.get() as { c: number }).c;
+  const bySource = stmts.cacheSummary.all() as Array<{
+    source: string;
+    instrument: string;
+    c: number;
+    earliest: number;
+    latest: number;
+  }>;
   return {
     totalBars: total,
     groups: bySource.map((g) => ({

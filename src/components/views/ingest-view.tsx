@@ -23,7 +23,6 @@ import {
   ShieldCheck,
   KeyRound,
   Lock,
-  LogOut,
   Search,
   Download,
   CheckCircle2,
@@ -84,53 +83,48 @@ export function IngestView() {
 
   return (
     <div className="space-y-5">
-      {/* Status banner */}
-      <div
-        className={cn(
-          'flex flex-wrap items-center gap-3 rounded-xl border p-4',
-          info?.state === 'authenticated'
-            ? 'border-emerald-500/30 bg-emerald-500/5'
-            : info?.state === 'error'
-              ? 'border-rose-500/30 bg-rose-500/5'
-              : 'border-border/70 bg-card'
-        )}
-      >
+      {/* Status banner — only shown while NOT authenticated (the sidebar
+          AuthStatusCard takes over once we are authenticated). */}
+      {info?.state !== 'authenticated' && (
         <div
           className={cn(
-            'flex h-10 w-10 items-center justify-center rounded-lg',
-            info?.state === 'authenticated'
-              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-              : 'bg-muted text-muted-foreground'
+            'flex flex-wrap items-center gap-3 rounded-xl border p-4',
+            info?.state === 'error'
+              ? 'border-rose-500/30 bg-rose-500/5'
+              : 'border-border/70 bg-card'
           )}
         >
-          {info?.state === 'authenticated' ? (
-            <ShieldCheck className="h-5 w-5" />
-          ) : info?.state === 'error' ? (
-            <AlertCircle className="h-5 w-5 text-rose-500" />
-          ) : (
-            <Radio className="h-5 w-5 animate-pulse" />
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold">Telegram MTProto Collector</span>
-            <StateBadge state={info?.state ?? 'disconnected'} />
+          <div
+            className={cn(
+              'flex h-10 w-10 items-center justify-center rounded-lg',
+              'bg-muted text-muted-foreground'
+            )}
+          >
+            {info?.state === 'error' ? (
+              <AlertCircle className="h-5 w-5 text-rose-500" />
+            ) : (
+              <Radio className="h-5 w-5 animate-pulse" />
+            )}
           </div>
-          <p className="text-xs text-muted-foreground">
-            {info?.me
-              ? `Authenticated as ${info.me.firstName} ${info.me.lastName} (${info.me.phone || info.me.username || info.me.id})`
-              : info?.state === 'connected'
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">Telegram MTProto Collector</span>
+              <StateBadge state={info?.state ?? 'disconnected'} />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {info?.state === 'connected'
                 ? 'Connected to Telegram. Awaiting authentication.'
                 : info?.state === 'error'
                   ? info.error
                   : 'teleproto MTProto client · full audit access to channels, groups & supergroups'}
-          </p>
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => statusQuery.refetch()} className="gap-1.5">
+            <RefreshCw className={cn('h-3.5 w-3.5', statusQuery.isFetching && 'animate-spin')} />
+            Refresh
+          </Button>
         </div>
-        <Button variant="ghost" size="sm" onClick={() => statusQuery.refetch()} className="gap-1.5">
-          <RefreshCw className={cn('h-3.5 w-3.5', statusQuery.isFetching && 'animate-spin')} />
-          Refresh
-        </Button>
-      </div>
+      )}
 
       {/* Auth wizard OR ingestion panel */}
       {info?.state !== 'authenticated' ? (
@@ -363,6 +357,9 @@ function IngestionPanel({
   // Page state for the paginated recent-messages list
   const [msgPage, setMsgPage] = React.useState(1)
   const [msgPageSize, setMsgPageSize] = React.useState(20)
+  // Tracks whether the user clicked "Stop" so the spinner can switch to a
+  // "Stopping…" state while the backend finishes its in-flight batch.
+  const [stopClicked, setStopClicked] = React.useState(false)
 
   const resolveMut = useMutation({
     mutationFn: (q: string) =>
@@ -394,7 +391,15 @@ function IngestionPanel({
   // No separate boolean state — derived directly from the socket event stream.
   // The HTTP /api/ingest call returns instantly; the socket events drive the UI.
   const isLive = !!progress && !['complete', 'error'].includes(progress.phase)
-  const ingesting = isLive || ingestMut.isPending
+  const isPaused = !!progress?.paused
+
+  // Reset the stopClicked flag once ingestion actually finishes or once a new
+  // ingestion starts (so a subsequent run shows the normal spinning state).
+  React.useEffect(() => {
+    if (ingestMut.isPending || !progress) setStopClicked(false)
+  }, [ingestMut.isPending, progress])
+
+  const ingesting = (isLive && !isPaused && !stopClicked) || ingestMut.isPending
 
   // Reset to page 1 when a new channel is ingested
   React.useEffect(() => {
@@ -433,16 +438,6 @@ function IngestionPanel({
           className="lg:col-span-2"
           title="Channel Ingestion"
           description="Resolve a channel by @username or title, then fetch its message history via MTProto."
-          actions={
-            <LogoutButton
-              onLogout={async () => {
-                await collectorFetch('/api/auth/logout', { method: 'POST', json: {} })
-                qc.invalidateQueries({ queryKey: ['collector-status'] })
-                setResolved(null)
-                setProgress(null)
-              }}
-            />
-          }
         >
           <div className="space-y-3">
             <div>
@@ -532,14 +527,31 @@ function IngestionPanel({
 
             <Button
               className="w-full gap-2"
-              disabled={!resolved || ingesting}
+              disabled={!resolved || ingesting || isPaused || stopClicked}
               onClick={() => {
                 onClearProgress()
+                setStopClicked(false)
                 ingestMut.mutate({ q: query, lim: limit })
               }}
             >
-              {ingesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-              {ingesting ? 'Ingesting…' : limit === 0 ? 'Ingest all messages' : `Ingest ${fmtInt(limit)} messages`}
+              {ingesting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : isPaused ? (
+                <Pause className="h-4 w-4 text-amber-500" />
+              ) : stopClicked ? (
+                <Square className="h-4 w-4 text-rose-500" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              {ingesting
+                ? 'Ingesting…'
+                : isPaused
+                  ? 'Paused'
+                  : stopClicked
+                    ? 'Stopping…'
+                    : limit === 0
+                      ? 'Ingest all messages'
+                      : `Ingest ${fmtInt(limit)} messages`}
             </Button>
           </div>
         </ChartCard>
@@ -604,8 +616,11 @@ function IngestionPanel({
                   </div>
                 </div>
               )}
-              {/* Pause / Resume / Stop controls — shown while ingestion is active */}
-              {isLive && (
+              {/* Pause / Resume / Stop controls — shown while ingestion is
+                  active. Hidden entirely once Stop has been clicked (the
+                  backend is winding down and we don't want to send conflicting
+                  control commands). */}
+              {isLive && !stopClicked && (
                 <div className="flex items-center gap-2 border-t border-border/60 pt-3">
                   {progress.paused ? (
                     <Button
@@ -632,7 +647,11 @@ function IngestionPanel({
                     variant="outline"
                     size="sm"
                     className="gap-1.5 flex-1 border-rose-500/30 text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
-                    onClick={() => collectorFetch('/api/ingest/stop', { method: 'POST', json: {} })}
+                    disabled={stopClicked}
+                    onClick={() => {
+                      setStopClicked(true)
+                      collectorFetch('/api/ingest/stop', { method: 'POST', json: {} })
+                    }}
                   >
                     <Square className="h-3.5 w-3.5" />
                     Stop
@@ -1089,14 +1108,5 @@ function MessageRow({
         {msg.rawText || <span className="italic text-muted-foreground">(no text — media only)</span>}
       </p>
     </button>
-  )
-}
-
-function LogoutButton({ onLogout }: { onLogout: () => void }) {
-  return (
-    <Button variant="ghost" size="sm" onClick={onLogout} className="gap-1.5 text-muted-foreground">
-      <LogOut className="h-3.5 w-3.5" />
-      Logout
-    </Button>
   )
 }

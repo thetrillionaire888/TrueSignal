@@ -53,22 +53,20 @@ export type Metrics = {
   rMultipleStd: number
 }
 
-// Build an equity curve from evaluation rows, ordered by evaluatedAt.
+// Build an equity curve from evaluation rows, ordered by postedAt.
 // Each closed trade contributes its R multiple; assumes 1% account risk per trade.
+// Days with no closed trades are emitted as zero-trade gap points so the series is
+// continuous across the full date range (better for visualization & drawdown charts).
 export function buildEquityCurve(rows: EvalRow[]): EquityPoint[] {
   const closed = rows
     .filter((r) => r.outcome !== 'pending')
-    .sort((a, b) => a.evaluatedAt.getTime() - b.evaluatedAt.getTime())
+    .sort((a, b) => a.postedAt.getTime() - b.postedAt.getTime())
 
-  let cumR = 0
-  let cumPnl = 0
-  let peak = 0
+  if (closed.length === 0) return []
+
   const byDay = new Map<string, { r: number; pnl: number; trades: number }>()
-
   for (const r of closed) {
-    cumR += r.rMultiple
-    cumPnl += r.pnlPercent
-    const day = r.evaluatedAt.toISOString().slice(0, 10)
+    const day = r.postedAt.toISOString().slice(0, 10)
     const entry = byDay.get(day) ?? { r: 0, pnl: 0, trades: 0 }
     entry.r += r.rMultiple
     entry.pnl += r.pnlPercent
@@ -76,14 +74,26 @@ export function buildEquityCurve(rows: EvalRow[]): EquityPoint[] {
     byDay.set(day, entry)
   }
 
+  // Build a complete daily date range from first to last signal day so gap days
+  // appear in the curve as zero-trade flat points.
+  const allDays = Array.from(byDay.keys()).sort()
+  const firstDay = allDays[0]
+  const lastDay = allDays[allDays.length - 1]
+  const completeDays: string[] = []
+  const cursor = new Date(firstDay + 'T00:00:00Z')
+  const end = new Date(lastDay + 'T00:00:00Z')
+  while (cursor <= end) {
+    completeDays.push(cursor.toISOString().slice(0, 10))
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
+
   // Build cumulative daily series with drawdown
-  const days = Array.from(byDay.keys()).sort()
   const points: EquityPoint[] = []
   let runningR = 0
   let runningPnl = 0
   let runPeak = 0
-  for (const day of days) {
-    const e = byDay.get(day)!
+  for (const day of completeDays) {
+    const e = byDay.get(day) ?? { r: 0, pnl: 0, trades: 0 }
     runningR += e.r
     runningPnl += e.pnl
     runPeak = Math.max(runPeak, runningR)
@@ -96,11 +106,7 @@ export function buildEquityCurve(rows: EvalRow[]): EquityPoint[] {
       drawdown: round(dd, 2),
       trades: e.trades,
     })
-    peak = runPeak
   }
-  void peak
-  void cumR
-  void cumPnl
   return points
 }
 
@@ -153,15 +159,19 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
   const sharpe = dailyStd > 0 ? (dailyMean / dailyStd) * ann : 0
   const sortino = downsideDailyStd > 0 ? (dailyMean / downsideDailyStd) * ann : 0
 
-  // Max drawdown in R (from equity curve)
-  const equity = buildEquityCurve(rows)
-  let peak = 0
-  let maxDD = 0
-  for (const p of equity) {
-    peak = Math.max(peak, p.cumulativeR)
-    maxDD = Math.min(maxDD, p.cumulativeR - peak)
+  // Max drawdown in R (computed per-trade, not from the daily-aggregated equity
+  // curve). Iterating each trade in postedAt order catches intra-day peaks that the
+  // daily aggregation would otherwise hide.
+  const sortedByPosted = [...closed].sort((a, b) => a.postedAt.getTime() - b.postedAt.getTime())
+  let tradePeak = 0
+  let tradeMaxDD = 0
+  let tradeCumR = 0
+  for (const r of sortedByPosted) {
+    tradeCumR += r.rMultiple
+    tradePeak = Math.max(tradePeak, tradeCumR)
+    tradeMaxDD = Math.min(tradeMaxDD, tradeCumR - tradePeak)
   }
-  const maxDrawdown = Math.abs(maxDD)
+  const maxDrawdown = Math.abs(tradeMaxDD)
 
   // Calmar = annualized return / max drawdown (both in R-space, daily mean × 252)
   const annualizedR = dailyMean * 252
@@ -191,13 +201,18 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
   const durations = closed.map((r) => r.durationMinutes ?? 0).filter(Boolean)
   const avgDurationMinutes = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : 0
 
+  // Win rate is computed over *decisive* trades only (wins + losses). Breakevens
+  // are excluded from the denominator — they are not wins, but counting them as
+  // losses would understate the win rate.
+  const decisive = wins.length + losses.length
+
   return {
     totalSignals: rows.length,
     closedSignals: n,
     wins: wins.length,
     losses: losses.length,
     breakevens: breakevens.length,
-    winRate: n ? wins.length / n : 0,
+    winRate: decisive ? wins.length / decisive : 0,
     avgRR: expectancy,
     avgWin,
     avgLoss,
@@ -209,10 +224,10 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
     sortino: round(sortino, 2),
     calmar: round(calmar, 2),
     maxDrawdown: round(maxDrawdown, 2),
-    maxDrawdownPct: round(maxDrawdown * 1.0, 2),
+    maxDrawdownPct: tradePeak > 0 ? round((maxDrawdown / tradePeak) * 100, 2) : round(maxDrawdown, 2),
     avgDurationMinutes: Math.round(avgDurationMinutes),
-    bestTrade: round(Math.max(...rs, 0), 2),
-    worstTrade: round(Math.min(...rs, 0), 2),
+    bestTrade: round(rs.length ? Math.max(...rs) : 0, 2),
+    worstTrade: round(rs.length ? Math.min(...rs) : 0, 2),
     longestStreak: bestStreak,
     worstStreak: worstStreak,
     rMultipleStd: round(std, 2),
@@ -223,14 +238,14 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
 export function rMultipleDistribution(rows: EvalRow[]) {
   const closed = rows.filter((r) => r.outcome !== 'pending')
   const buckets = [
-    { label: '≤ -1R', min: -Infinity, max: -1.01, count: 0 },
+    { label: '< -1R', min: -Infinity, max: -1.01, count: 0 },
     { label: '-1R', min: -1.01, max: -0.5, count: 0 },
     { label: '-0.5R', min: -0.5, max: -0.01, count: 0 },
     { label: '0R', min: -0.01, max: 0.49, count: 0 },
     { label: '+1R', min: 0.49, max: 1.49, count: 0 },
     { label: '+2R', min: 1.49, max: 2.49, count: 0 },
     { label: '+3R', min: 2.49, max: 3.49, count: 0 },
-    { label: '≥ +3R', min: 3.49, max: Infinity, count: 0 },
+    { label: '> +3R', min: 3.49, max: Infinity, count: 0 },
   ]
   for (const r of closed) {
     for (const b of buckets) {

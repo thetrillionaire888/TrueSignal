@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
 import { loadEvalRows, loadChannelsWithMeta } from '@/lib/queries'
 import { computeMetrics } from '@/lib/metrics'
 
@@ -35,7 +34,7 @@ export async function GET() {
       category: c.category,
       description: c.description,
       subscriberCount: c.subscriberCount,
-      verified: c.verified,
+      verified: Boolean(c.verified),
       avatarColor: c.avatarColor,
       region: c.region,
       monitoredSince: c.monitoredSince,

@@ -19,6 +19,7 @@ import {
   ArrowDownRight,
   Gauge,
   Zap,
+  AlertCircle,
 } from 'lucide-react'
 
 type Overview = {
@@ -50,11 +51,12 @@ type Overview = {
 
 export function OverviewView() {
   const { openChannel } = useUI()
-  const { data, isLoading, refetch, isFetching } = useQuery<Overview>({
+  const { data, isLoading, isError, refetch } = useQuery<Overview>({
     queryKey: ['overview'],
     queryFn: async () => (await fetch('/api/overview')).json(),
   })
 
+  if (isError) return <OverviewError onRetry={() => refetch()} />
   if (isLoading || !data) return <OverviewSkeleton />
 
   const m = data.metrics
@@ -287,11 +289,26 @@ export function OverviewView() {
 
       <div className="flex items-center justify-center pt-2 text-xs text-muted-foreground">
         <Trophy className="mr-1.5 h-3.5 w-3.5 text-amber-500" />
-        Auditing {fmtInt(data.metrics.totalSignals)} signals · {fmtCompact(data.channels.reduce((a, b) => a + 0, 0))} sources monitored
+        Auditing {fmtInt(data.metrics.totalSignals)} signals · {fmtCompact(data.channels.length)} sources monitored
       </div>
-      <div className="hidden">
-        <button onClick={() => refetch()}>{isFetching ? 'fetching' : 'idle'}</button>
+    </div>
+  )
+}
+
+function OverviewError({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/5 p-10 text-center">
+      <AlertCircle className="h-8 w-8 text-rose-500" />
+      <div>
+        <div className="text-sm font-semibold text-rose-600 dark:text-rose-400">Failed to load overview</div>
+        <p className="mt-1 text-xs text-muted-foreground">The collector service or audit DB may be unreachable.</p>
       </div>
+      <button
+        onClick={onRetry}
+        className="rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium hover:bg-muted"
+      >
+        Retry
+      </button>
     </div>
   )
 }

@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
 import { loadEvalRows, loadChannelsWithMeta } from '@/lib/queries'
 import { computeMetrics, buildEquityCurve, channelBreakdown } from '@/lib/metrics'
 

@@ -2,15 +2,23 @@
 // caching to avoid re-downloading the same bars) and determines whether each
 // parsed signal resulted in a win (TP hit) or loss (SL hit).
 // Computes R-multiple, MFE, MAE, and duration for each signal.
-import { Database } from "bun:sqlite";
-import { resolve } from "node:path";
+//
+// Uses the shared `sqlite` connection from `@/lib/db` (audit.db is the main
+// DB; Signal/Message/Evaluation live there — no prefix needed).
+//
+// Entry-fill model (driven by `entryType` parsed from signal.notes):
+//   - market: fill immediately at the first bar's open
+//   - limit:  buy=triggered when bar.low ≤ entry; sell=triggered when bar.high ≥ entry
+//   - stop:   buy=triggered when bar.high ≥ entry; sell=triggered when bar.low ≤ entry
+//   - range:  walk forward to first range-touch; conservative fill at edge closest to SL
+//
+// Evaluation runs as 4 parallel async workers, each batching writes (25/batch)
+// into a single transaction to amortize COMMIT cost. SQLite writes are
+// serialized on the shared connection; reads happen during the async
+// `fetchBars` await, so workers interleave productively.
+import { sqlite } from "@/lib/db";
 import { cuid } from "./cuid";
 import { fetchBarsCached, type Bar, type CacheStats } from "./bar-cache";
-
-const DB_PATH = resolve(import.meta.dir, "../../db/custom.db");
-const db = new Database(DB_PATH);
-db.exec("PRAGMA journal_mode = WAL;");
-db.exec("PRAGMA busy_timeout = 5000;");
 
 // ── Instrument mapping: our DB instruments → Dukascopy instrument IDs ────────
 const INSTRUMENT_MAP: Record<string, string> = {
@@ -52,8 +60,41 @@ function toDukascopyInstrument(instrument: string): string | null {
   return INSTRUMENT_MAP[key] ?? null;
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Parse a date string stored in the DB into epoch milliseconds.
+ * Tolerates both:
+ *   - epoch-millis strings (e.g. "1720425600000") — emitted by some legacy rows
+ *   - ISO 8601 strings (e.g. "2024-07-08T15:20:00.000Z") — the default
+ * Falls back to NaN on garbage input (caller should treat NaN as "now").
+ */
+function parseDbDate(s: string): number {
+  if (typeof s === "number") return s;
+  if (!s) return NaN;
+  // Pure-digit string → epoch millis (assume ms; if it's a 10-digit number
+  // it's likely seconds, but our DB stores ms so we don't try to detect).
+  if (/^\d+$/.test(s)) return Number(s);
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? NaN : t;
+}
+
+type EntryType = "stop" | "limit" | "market" | "range";
+
+/**
+ * Extract the entry-type tag from the signal's notes field. The parser can
+ * emit a structured tag like `entryType:stop` / `entryType:limit` /
+ * `entryType:market` / `entryType:range` inside the notes string. Defaults to
+ * `market` (immediate fill) when no tag is present — the most permissive
+ * interpretation.
+ */
+function extractEntryType(notes: string | null | undefined): EntryType {
+  if (!notes) return "market";
+  const m = notes.match(/entryType\s*[:=]\s*(stop|limit|market|range)/i);
+  return (m?.[1].toLowerCase() as EntryType) ?? "market";
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
-// Bar type is imported from bar-cache.ts
 
 type SignalRow = {
   signalId: string;
@@ -67,6 +108,7 @@ type SignalRow = {
   isRange: number; // SQLite stores boolean as 0/1
   stopLoss: number;
   takeProfits: string; // JSON array string
+  notes: string | null;
   postedAt: string;
 };
 
@@ -88,46 +130,49 @@ type EvalResult = {
 };
 
 // ── Prepared statements ──────────────────────────────────────────────────────
+// Signal/Message/Evaluation live in audit.db (the main DB, no prefix).
 const stmts = {
-  getUnevaluatedSignals: db.prepare<SignalRow, Record<string, never>>(
+  getUnevaluatedSignals: sqlite.prepare(
     `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
-            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits, m.postedAt
+            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+            s.notes, m.postedAt
      FROM Signal s
      JOIN Message m ON s.messageId = m.id
      LEFT JOIN Evaluation e ON e.signalId = s.id
      WHERE e.signalId IS NULL
      ORDER BY m.postedAt ASC`
   ),
-  getUnevaluatedByChannel: db.prepare<SignalRow, { $channelId: string }>(
+  getUnevaluatedByChannel: sqlite.prepare(
     `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
-            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits, m.postedAt
+            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+            s.notes, m.postedAt
      FROM Signal s
      JOIN Message m ON s.messageId = m.id
      LEFT JOIN Evaluation e ON e.signalId = s.id
      WHERE e.signalId IS NULL AND s.channelId = $channelId
      ORDER BY m.postedAt ASC`
   ),
-  insertEvaluation: db.prepare<unknown, Record<string, unknown>>(
+  insertEvaluation: sqlite.prepare(
     `INSERT OR REPLACE INTO Evaluation
-     (id, signalId, outcome, exitPrice, exitReason, hitTpLevel,
-      maxFavorablePct, maxAdversePct, rMultiple, pnlPercent, durationMinutes,
-      marketDataSource, evaluatedAt)
+       (id, signalId, outcome, exitPrice, exitReason, hitTpLevel,
+        maxFavorablePct, maxAdversePct, rMultiple, pnlPercent, durationMinutes,
+        marketDataSource, evaluatedAt)
      VALUES ($id, $signalId, $outcome, $exitPrice, $exitReason, $hitTpLevel,
              $maxFavorablePct, $maxAdversePct, $rMultiple, $pnlPercent, $durationMinutes,
              $marketDataSource, $evaluatedAt)`
   ),
-  countEvaluated: db.prepare<{ c: number }, { $channelId?: string }>(
+  // Note: the EVAL_CHANNEL_FILTER branch is intentionally inert — preserved
+  // from the original code; the param-binding path is identical either way.
+  countEvaluated: sqlite.prepare(
     `SELECT COUNT(*) as c FROM Evaluation e
      JOIN Signal s ON e.signalId = s.id
      ${process.env.EVAL_CHANNEL_FILTER ? "" : ""}`
   ),
-  countEvaluatedByChannel: db.prepare<{ c: number }, { $channelId: string }>(
+  countEvaluatedByChannel: sqlite.prepare(
     "SELECT COUNT(*) as c FROM Evaluation e JOIN Signal s ON e.signalId = s.id WHERE s.channelId = $channelId"
   ),
-  countTotalSignals: db.prepare<{ c: number }, { $channelId?: string }>(
-    "SELECT COUNT(*) as c FROM Signal"
-  ),
-  countTotalSignalsByChannel: db.prepare<{ c: number }, { $channelId: string }>(
+  countTotalSignals: sqlite.prepare("SELECT COUNT(*) as c FROM Signal"),
+  countTotalSignalsByChannel: sqlite.prepare(
     "SELECT COUNT(*) as c FROM Signal WHERE channelId = $channelId"
   ),
 };
@@ -146,13 +191,21 @@ async function fetchBars(
 }
 
 // ── Evaluate a single signal against historical bars ────────────────────────
+// Now supports 4 entry-fill models dispatched via `entryType` parsed from the
+// signal's notes field:
+//   - market:  immediate fill at first bar's open
+//   - limit:   buy when bar.low ≤ entry;  sell when bar.high ≥ entry
+//   - stop:    buy when bar.high ≥ entry; sell when bar.low ≤ entry
+//   - range:   walk forward to first range-touch; conservative fill at edge
+//              closest to SL (worst-case R)
 function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
   const tps = JSON.parse(signal.takeProfits) as number[];
   const tp = tps.length > 0 ? tps[0] : null; // evaluate against first TP
   const sl = signal.stopLoss;
   const isLong = signal.action === "long";
-  const isRange = signal.isRange === 1;
+  const entryType = extractEntryType(signal.notes);
   const now = new Date().toISOString();
+  const postedAtMs = parseDbDate(signal.postedAt);
 
   const base: Partial<EvalResult> = {
     signalId: signal.signalId,
@@ -170,39 +223,31 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
     return { ...base, outcome: "no_data", exitPrice: null, exitReason: null, hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
   }
 
-  // ── Determine the effective entry price ──────────────────────────────────
-  // For range signals: walk forward to find when price first touches the range,
-  // then use the conservative fill (range edge closest to SL = worst case).
-  // For single-price signals: use the entry price directly.
-  let entry: number;
-  let fillBarIndex = 0; // index in bars[] where entry was filled
+  // ── Determine the effective entry price + fill bar index ─────────────────
+  let entry: number = signal.entryPrice;
+  let fillBarIndex = 0;
 
-  if (isRange && signal.entryLow != null && signal.entryHigh != null) {
+  if (entryType === "range" && signal.entryLow != null && signal.entryHigh != null) {
     const entryLow = signal.entryLow;
     const entryHigh = signal.entryHigh;
-    // Conservative fill: edge closest to SL (worst-case R)
-    // For LONG: SL is below entry, so worst fill = entryHigh (furthest from SL = largest risk... no wait)
-    // For LONG: SL below, worst fill = entryLow (closest to SL, smallest buffer) — NO
-    // Actually for LONG: risk = entry - SL. Worst case = entry closest to SL = entryLow.
-    // For SHORT: SL above, risk = SL - entry. Worst case = entry closest to SL = entryHigh.
+    // Conservative fill: edge closest to SL (worst-case R).
+    //   LONG  → SL is below entry → worst fill = entryLow (closest to SL)
+    //   SHORT → SL is above entry → worst fill = entryHigh (closest to SL)
     const conservativeFill = isLong ? entryLow : entryHigh;
 
-    // Walk forward to find first bar where price touches the range
     let filled = false;
     for (let i = 0; i < bars.length; i++) {
       const bar = bars[i];
-      // Range is touched if the bar's high ≥ entryLow AND low ≤ entryHigh
-      // (i.e., the bar's price range overlaps with the entry range)
+      // Range touched = bar's price range overlaps with the entry range
       if (bar.high >= entryLow && bar.low <= entryHigh) {
         entry = conservativeFill;
         fillBarIndex = i;
         filled = true;
         break;
       }
-      // Also check if SL or TP is hit BEFORE the range is touched (signal invalidated)
+      // SL hit BEFORE range touched → signal never triggered
       if (isLong) {
         if (bar.low <= sl) {
-          // Price hit SL before touching the buy range — signal never triggered
           return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
         }
       } else {
@@ -213,11 +258,80 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
     }
 
     if (!filled) {
-      // Range was never touched within the evaluation window
       return { ...base, outcome: "invalid", exitPrice: null, exitReason: "range_not_touched", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
     }
+  } else if (entryType === "market") {
+    // Market entry — fill at the first bar's open (immediate execution).
+    entry = bars[0].open;
+    fillBarIndex = 0;
+  } else if (entryType === "stop") {
+    // Stop entry:
+    //   Buy stop (LONG):  triggers when bar.high ≥ entry (price rises above stop)
+    //   Sell stop (SHORT): triggers when bar.low ≤ entry (price falls below stop)
+    let filled = false;
+    for (let i = 0; i < bars.length; i++) {
+      const bar = bars[i];
+      if (isLong) {
+        if (bar.low <= sl) {
+          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+        }
+        if (bar.high >= signal.entryPrice) {
+          entry = signal.entryPrice;
+          fillBarIndex = i;
+          filled = true;
+          break;
+        }
+      } else {
+        if (bar.high >= sl) {
+          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+        }
+        if (bar.low <= signal.entryPrice) {
+          entry = signal.entryPrice;
+          fillBarIndex = i;
+          filled = true;
+          break;
+        }
+      }
+    }
+    if (!filled) {
+      return { ...base, outcome: "invalid", exitPrice: null, exitReason: "stop_not_triggered", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+    }
+  } else if (entryType === "limit") {
+    // Limit entry:
+    //   Buy limit (LONG):  triggers when bar.low ≤ entry (price falls to limit)
+    //   Sell limit (SHORT): triggers when bar.high ≥ entry (price rises to limit)
+    let filled = false;
+    for (let i = 0; i < bars.length; i++) {
+      const bar = bars[i];
+      if (isLong) {
+        if (bar.low <= sl) {
+          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+        }
+        if (bar.low <= signal.entryPrice) {
+          entry = signal.entryPrice;
+          fillBarIndex = i;
+          filled = true;
+          break;
+        }
+      } else {
+        if (bar.high >= sl) {
+          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+        }
+        if (bar.high >= signal.entryPrice) {
+          entry = signal.entryPrice;
+          fillBarIndex = i;
+          filled = true;
+          break;
+        }
+      }
+    }
+    if (!filled) {
+      return { ...base, outcome: "invalid", exitPrice: null, exitReason: "limit_not_triggered", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+    }
   } else {
+    // Default fallback (no entryType) — treat as immediate market fill.
     entry = signal.entryPrice;
+    fillBarIndex = 0;
   }
 
   // Edge case: SL == entry → risk is 0, can't compute R
@@ -286,6 +400,9 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
       ? (currentPrice - entry) / risk
       : (entry - currentPrice) / risk;
     // If unrealized R is very small, mark breakeven; otherwise mark as still open
+    const durationMin = Number.isNaN(postedAtMs)
+      ? null
+      : Math.round((lastBar.timestamp - postedAtMs) / 60000);
     if (Math.abs(unrealizedR) < 0.1) {
       return {
         ...base,
@@ -297,7 +414,7 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
         maxAdversePct: (maxAdv / entry) * 100,
         rMultiple: 0,
         pnlPercent: 0,
-        durationMinutes: Math.round((lastBar.timestamp - new Date(signal.postedAt).getTime()) / 60000),
+        durationMinutes: durationMin,
       } as EvalResult;
     }
     // Mark as win/loss based on current direction
@@ -312,7 +429,7 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
       maxAdversePct: (maxAdv / entry) * 100,
       rMultiple: Math.round(unrealizedR * 100) / 100,
       pnlPercent: Math.round(unrealizedR * 100) / 100,
-      durationMinutes: Math.round((lastBar.timestamp - new Date(signal.postedAt).getTime()) / 60000),
+      durationMinutes: durationMin,
     } as EvalResult;
   }
 
@@ -321,8 +438,8 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
     ? (exitPrice - entry) / risk
     : (entry - exitPrice) / risk;
   const pnlPercent = Math.round(rMultiple * 100) / 100; // 1R = 1% account
-  const durationMinutes = exitTime
-    ? Math.round((exitTime - new Date(signal.postedAt).getTime()) / 60000)
+  const durationMinutes = exitTime && !Number.isNaN(postedAtMs)
+    ? Math.round((exitTime - postedAtMs) / 60000)
     : null;
 
   return {
@@ -339,7 +456,7 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
   } as EvalResult;
 }
 
-// ── Save evaluation to DB ────────────────────────────────────────────────────
+// ── Save evaluation to DB (single-row helper, used outside batches) ─────────
 function saveEvaluation(result: EvalResult) {
   stmts.insertEvaluation.run({
     $id: cuid(),
@@ -358,7 +475,39 @@ function saveEvaluation(result: EvalResult) {
   });
 }
 
-// ── Main evaluation runner ───────────────────────────────────────────────────
+/**
+ * Save a batch of evaluation results in a single transaction. Amortizes COMMIT
+ * cost across BATCH_SIZE rows — critical for keeping up with the 4-worker
+ * evaluation throughput.
+ */
+function saveEvaluationBatch(batch: EvalResult[]) {
+  if (batch.length === 0) return;
+  const tx = sqlite.transaction(() => {
+    for (const result of batch) {
+      stmts.insertEvaluation.run({
+        $id: cuid(),
+        $signalId: result.signalId,
+        $outcome: result.outcome,
+        $exitPrice: result.exitPrice,
+        $exitReason: result.exitReason,
+        $hitTpLevel: result.hitTpLevel,
+        $maxFavorablePct: result.maxFavorablePct,
+        $maxAdversePct: result.maxAdversePct,
+        $rMultiple: result.rMultiple,
+        $pnlPercent: result.pnlPercent,
+        $durationMinutes: result.durationMinutes,
+        $marketDataSource: "dukascopy-m15",
+        $evaluatedAt: result.evaluatedAt,
+      });
+    }
+  });
+  tx();
+}
+
+// ── Parallel 4-worker evaluation runner ──────────────────────────────────────
+const NUM_WORKERS = 4;
+const BATCH_SIZE = 25;
+
 export type EvalProgress = {
   jobId: string;
   phase: "starting" | "fetching" | "evaluating" | "complete" | "error";
@@ -386,42 +535,31 @@ export type EvalProgress = {
   };
 };
 
-export async function evaluateSignals(
-  channelId: string | null,
-  onProgress: (p: EvalProgress) => void
-): Promise<void> {
-  const jobId = `eval-${Date.now()}`;
-  const signals: SignalRow[] = channelId
-    ? stmts.getUnevaluatedByChannel.all({ $channelId: channelId })
-    : stmts.getUnevaluatedSignals.all({} as never);
-
-  onProgress({
-    jobId,
-    phase: "starting",
-    message: `Found ${signals.length} unevaluated signals to evaluate against Dukascopy historical data.`,
-    total: signals.length,
-    current: 0,
-  });
-
-  if (signals.length === 0) {
-    onProgress({
-      jobId,
-      phase: "complete",
-      message: "No unevaluated signals found. All signals already have evaluations.",
-      total: 0,
-      current: 0,
-      summary: { total: 0, wins: 0, losses: 0, breakeven: 0, invalid: 0, noData: 0, winRate: 0, totalR: 0 },
-    });
-    return;
-  }
-
+/**
+ * Worker function: processes a slice of signals, fetching bars + evaluating
+ * each, and batch-writing results in groups of BATCH_SIZE inside a single
+ * transaction. Returns the worker's local results + cache stats.
+ *
+ * Workers interleave on the await boundaries of `fetchBars` (network I/O), so
+ * all 4 workers stay busy even though the underlying SQLite connection is
+ * single-writer. Writes are serialized but tiny (one tx per 25 rows).
+ */
+async function runWorker(
+  workerId: number,
+  workerSignals: SignalRow[],
+  onProgress: (p: EvalProgress) => void,
+  jobId: string,
+  totalSignals: number,
+  progressCounter: { current: number }
+): Promise<{ results: EvalResult[]; cached: number; fetched: number }> {
   const results: EvalResult[] = [];
-  let current = 0;
-  let totalCached = 0;
-  let totalFetched = 0;
+  let cached = 0;
+  let fetched = 0;
+  const pending: EvalResult[] = [];
 
-  for (const signal of signals) {
-    current++;
+  for (const signal of workerSignals) {
+    progressCounter.current++;
+    const current = progressCounter.current;
     const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
 
     if (!dukascopyInstrument) {
@@ -442,22 +580,35 @@ export async function evaluateSignals(
         instrument: signal.instrument,
         dukascopyInstrument: "n/a",
       };
-      saveEvaluation(result);
+      pending.push(result);
       results.push(result);
+      if (pending.length >= BATCH_SIZE) {
+        saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
+      }
+      if (workerId === 0) {
+        onProgress({
+          jobId,
+          phase: "evaluating",
+          message: `[w${workerId}] Skipping unknown instrument ${signal.instrument}`,
+          current,
+          total: totalSignals,
+          instrument: signal.instrument,
+        });
+      }
       continue;
     }
 
     onProgress({
       jobId,
       phase: "fetching",
-      message: `Fetching ${dukascopyInstrument.toUpperCase()} m15 bars for ${signal.instrument} ${signal.action} signal…`,
+      message: `[w${workerId}] Fetching ${dukascopyInstrument.toUpperCase()} m15 bars for ${signal.instrument} ${signal.action}…`,
       current,
-      total: signals.length,
+      total: totalSignals,
       instrument: signal.instrument,
     });
 
     // Fetch 48h of m15 bars starting from signal post time (uses DB cache)
-    const signalTime = new Date(signal.postedAt);
+    const signalTime = new Date(parseDbDate(signal.postedAt) || Date.now());
     let cacheMsg = "";
     const { bars, stats: cacheStats } = await fetchBars(
       dukascopyInstrument,
@@ -466,25 +617,86 @@ export async function evaluateSignals(
       (msg) => { cacheMsg = msg; }
     );
 
-    totalCached += cacheStats.cached;
-    totalFetched += cacheStats.fetched;
+    cached += cacheStats.cached;
+    fetched += cacheStats.fetched;
 
     onProgress({
       jobId,
       phase: "evaluating",
-      message: `Evaluating ${signal.instrument} ${signal.action} (entry ${signal.entryPrice}) against ${bars.length} bars… (${cacheMsg || "cache ready"})`,
+      message: `[w${workerId}] Evaluating ${signal.instrument} ${signal.action} (entry ${signal.entryPrice}) against ${bars.length} bars… (${cacheMsg || "cache ready"})`,
       current,
-      total: signals.length,
+      total: totalSignals,
       instrument: signal.instrument,
     });
 
     const result = evaluateSignal(signal, bars);
-    saveEvaluation(result);
+    pending.push(result);
     results.push(result);
+
+    if (pending.length >= BATCH_SIZE) {
+      saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
+    }
 
     // Small delay to avoid hammering Dukascopy
     await new Promise((r) => setTimeout(r, 300));
   }
+
+  // Flush any remaining results in the batch buffer
+  if (pending.length > 0) {
+    saveEvaluationBatch(pending);
+  }
+
+  return { results, cached, fetched };
+}
+
+export async function evaluateSignals(
+  channelId: string | null,
+  onProgress: (p: EvalProgress) => void
+): Promise<void> {
+  const jobId = `eval-${Date.now()}`;
+  const signals: SignalRow[] = channelId
+    ? (stmts.getUnevaluatedByChannel.all({ $channelId: channelId }) as SignalRow[])
+    : (stmts.getUnevaluatedSignals.all() as SignalRow[]);
+
+  onProgress({
+    jobId,
+    phase: "starting",
+    message: `Found ${signals.length} unevaluated signals to evaluate against Dukascopy historical data. Running ${NUM_WORKERS} parallel workers (batch size ${BATCH_SIZE}).`,
+    total: signals.length,
+    current: 0,
+  });
+
+  if (signals.length === 0) {
+    onProgress({
+      jobId,
+      phase: "complete",
+      message: "No unevaluated signals found. All signals already have evaluations.",
+      total: 0,
+      current: 0,
+      summary: { total: 0, wins: 0, losses: 0, breakeven: 0, invalid: 0, noData: 0, winRate: 0, totalR: 0 },
+    });
+    return;
+  }
+
+  // ── Partition signals across NUM_WORKERS workers (round-robin) ───────────
+  // Round-robin keeps the workload balanced even if signal difficulty varies
+  // (some signals hit cache, others trigger network fetches).
+  const workerQueues: SignalRow[][] = Array.from({ length: NUM_WORKERS }, () => []);
+  for (let i = 0; i < signals.length; i++) {
+    workerQueues[i % NUM_WORKERS].push(signals[i]);
+  }
+
+  const progressCounter = { current: 0 };
+  const workerResults = await Promise.all(
+    workerQueues.map((queue, i) =>
+      runWorker(i, queue, onProgress, jobId, signals.length, progressCounter)
+    )
+  );
+
+  // ── Aggregate results from all workers ───────────────────────────────────
+  const results: EvalResult[] = workerResults.flatMap((r) => r.results);
+  const totalCached = workerResults.reduce((a, b) => a + b.cached, 0);
+  const totalFetched = workerResults.reduce((a, b) => a + b.fetched, 0);
 
   // Summary
   const wins = results.filter((r) => r.outcome === "win").length;
@@ -527,9 +739,9 @@ export async function evaluateSignals(
 export function getEvalStats(channelId?: string) {
   const total = channelId
     ? (stmts.countTotalSignalsByChannel.get({ $channelId: channelId }) as { c: number }).c
-    : (stmts.countTotalSignals.get({} as never) as { c: number }).c;
+    : (stmts.countTotalSignals.get() as { c: number }).c;
   const evaluated = channelId
     ? (stmts.countEvaluatedByChannel.get({ $channelId: channelId }) as { c: number }).c
-    : (stmts.countEvaluated.get({} as never) as { c: number }).c;
+    : (stmts.countEvaluated.get() as { c: number }).c;
   return { total, evaluated, pending: total - evaluated };
 }

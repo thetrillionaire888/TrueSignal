@@ -16,6 +16,7 @@ import { cn } from '@/lib/utils'
 import {
   Download,
   Upload,
+  CloudDownload,
   Database,
   FileJson,
   FileSpreadsheet,
@@ -45,7 +46,7 @@ const SOURCES = [
     id: 'dukascopy',
     label: 'Dukascopy',
     desc: 'Forex, metals, crypto, indices — 15+ years of tick data',
-    icon: TrendingUp,
+    icon: CloudDownload,
     color: 'text-teal-500',
     note: 'Free public API · no auth required',
   },
@@ -53,7 +54,7 @@ const SOURCES = [
     id: 'binance',
     label: 'Binance',
     desc: 'Crypto spot klines (BTC, ETH, altcoins)',
-    icon: TrendingUp,
+    icon: CloudDownload,
     color: 'text-amber-500',
     note: 'Free public API · no auth required',
   },
@@ -61,7 +62,7 @@ const SOURCES = [
     id: 'yahoo',
     label: 'Yahoo Finance',
     desc: 'Stocks, ETFs, indices (AAPL, TSLA, SPY…)',
-    icon: TrendingUp,
+    icon: CloudDownload,
     color: 'text-violet-500',
     note: 'Free public API · no auth required',
   },
@@ -69,7 +70,7 @@ const SOURCES = [
     id: 'darwinex',
     label: 'Darwinex',
     desc: 'Darwinex broker — requires OAuth2 auth',
-    icon: TrendingUp,
+    icon: CloudDownload,
     color: 'text-rose-500',
     note: 'Requires auth — export as CSV from Darwinex and use CSV import',
   },
@@ -101,8 +102,8 @@ export function DataManagerView() {
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList className="grid w-full grid-cols-3 max-w-md">
           <TabsTrigger value="import" className="gap-1.5">
-            <Upload className="h-3.5 w-3.5" />
-            Import
+            <CloudDownload className="h-3.5 w-3.5" />
+            Fetch
           </TabsTrigger>
           <TabsTrigger value="export" className="gap-1.5">
             <Download className="h-3.5 w-3.5" />
@@ -188,6 +189,7 @@ function ImportTab() {
   })
 
   const isDarwinex = selectedSource === 'darwinex'
+  const isCsv = selectedSource === 'csv'
 
   return (
     <div className="space-y-5">
@@ -222,7 +224,7 @@ function ImportTab() {
 
       {/* Import form */}
       <ChartCard
-        title={`Import from ${sourceMeta.label}`}
+        title={isCsv ? `Import from ${sourceMeta.label}` : `Fetch from ${sourceMeta.label}`}
         description={sourceMeta.desc}
       >
         {isDarwinex ? (
@@ -237,7 +239,7 @@ function ImportTab() {
           <div className="space-y-4">
             {selectedSource !== 'csv' && (
               <>
-                <div className="grid gap-3 sm:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-2">
                   <div>
                     <Label className="mb-1.5 block text-xs">Instrument / Symbol</Label>
                     <Input
@@ -261,14 +263,16 @@ function ImportTab() {
                       </SelectContent>
                     </Select>
                   </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <Label className="mb-1.5 block text-xs">Start Date</Label>
+                    <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={importMut.isPending} />
+                  </div>
                   <div>
                     <Label className="mb-1.5 block text-xs">End Date</Label>
                     <Input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={importMut.isPending} />
                   </div>
-                </div>
-                <div>
-                  <Label className="mb-1.5 block text-xs">Start Date</Label>
-                  <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={importMut.isPending} />
                 </div>
               </>
             )}
@@ -325,7 +329,7 @@ function ImportTab() {
               <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 text-sm">
                 <div className="flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
                   <CheckCircle2 className="h-4 w-4" />
-                  Import successful
+                  {isCsv ? 'Import successful' : 'Fetch successful'}
                 </div>
                 <div className="mt-2 grid grid-cols-3 gap-3 text-xs">
                   <div>
@@ -354,8 +358,10 @@ function ImportTab() {
               onClick={() => importMut.mutate()}
               disabled={importMut.isPending || (selectedSource === 'csv' && !csvText && !csvFile) || !instrument}
             >
-              {importMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-              {importMut.isPending ? 'Importing…' : `Import ${sourceMeta.label} data`}
+              {importMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : isCsv ? <Upload className="h-4 w-4" /> : <CloudDownload className="h-4 w-4" />}
+              {importMut.isPending
+                ? (isCsv ? 'Importing…' : 'Fetching…')
+                : (isCsv ? `Import ${sourceMeta.label} data` : `Fetch ${sourceMeta.label} data`)}
             </Button>
           </div>
         )}

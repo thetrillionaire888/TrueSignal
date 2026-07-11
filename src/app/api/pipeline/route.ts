@@ -1,47 +1,34 @@
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import {
+  countMessages,
+  countMessagesByParseStatus,
+  countSignals,
+  countEvaluations,
+  countChannels,
+  getRecentMessages,
+  getMessageCountsPerChannel,
+} from '@/lib/queries'
 
 export const dynamic = 'force-dynamic'
 
 export async function GET() {
   const [totalMessages, parsedMessages, noSignalMessages, totalSignals, evaluated, channels] =
     await Promise.all([
-      db.message.count(),
-      db.message.count({ where: { parseStatus: 'parsed' } }),
-      db.message.count({ where: { parseStatus: 'no_signal' } }),
-      db.signal.count(),
-      db.evaluation.count(),
-      db.channel.count(),
+      countMessages(),
+      countMessagesByParseStatus('parsed'),
+      countMessagesByParseStatus('no_signal'),
+      countSignals(),
+      countEvaluations(),
+      countChannels(),
     ])
 
   const pendingMessages = totalMessages - parsedMessages - noSignalMessages
 
   // recent ingestion events (last 12 messages)
-  const recent = await db.message.findMany({
-    take: 12,
-    orderBy: { ingestedAt: 'desc' },
-    include: { channel: true },
-  })
+  const recent = await getRecentMessages(12)
 
   // per-channel ingestion counts
-  const perChannel = await db.message.groupBy({
-    by: ['channelId'],
-    _count: true,
-  })
-  const channelInfo = await db.channel.findMany()
-  const channelMap = new Map(channelInfo.map((c) => [c.id, c]))
-  const channelStats = perChannel
-    .map((p) => {
-      const c = channelMap.get(p.channelId)!
-      return {
-        name: c.name,
-        telegramId: c.telegramId,
-        category: c.category,
-        messages: p._count,
-        status: c.status,
-      }
-    })
-    .sort((a, b) => b.messages - a.messages)
+  const channelStats = await getMessageCountsPerChannel()
 
   const stages = [
     {
@@ -116,13 +103,13 @@ export async function GET() {
     channelStats,
     recent: recent.map((m) => ({
       id: m.id,
-      channel: m.channel.name,
-      telegramId: m.channel.telegramId,
+      channel: m.channelName,
+      telegramId: m.telegramId,
       parseStatus: m.parseStatus,
       postedAt: m.postedAt,
       ingestedAt: m.ingestedAt,
       views: m.views,
-      preview: m.rawText.slice(0, 80),
+      preview: (m.rawText ?? '').slice(0, 80),
     })),
   })
 }

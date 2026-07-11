@@ -44,7 +44,7 @@ function Footer() {
       <div className="flex flex-col items-center justify-between gap-2 text-xs text-muted-foreground sm:flex-row">
         <div className="flex items-center gap-1.5">
           <Radar className="h-3.5 w-3.5 text-primary" />
-          <span className="font-medium text-foreground">SignalAudit</span>
+          <span className="font-medium text-foreground">TrueSignal</span>
           <span>· Telegram Trading Signal Analytics</span>
         </div>
         <div className="flex items-center gap-3">

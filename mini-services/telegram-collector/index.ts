@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { Server as IOServer } from "socket.io";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { sqlite } from "@/lib/db";
 import * as tg from "./telegram";
 import { parseSignal } from "./parser";
 import { evaluateSignals, getEvalStats, type EvalProgress } from "./evaluator";
@@ -233,12 +234,9 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       const instrument = url.searchParams.get("instrument") || undefined;
       const source = url.searchParams.get("source") || undefined;
 
-      const { Database } = await import("bun:sqlite");
-      const dbPath = resolve(import.meta.dir, "../../db/custom.db");
-      const exportDb = new Database(dbPath);
-      exportDb.exec("PRAGMA busy_timeout = 5000;");
-
-      let query = "SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume FROM PriceBar";
+      // Use the shared `sqlite` connection (audit.db with market.db ATTACH'd).
+      // market.PriceBar is the attached table alias.
+      let query = "SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume FROM market.PriceBar";
       const conditions: string[] = [];
       const params: Record<string, unknown> = {};
       if (instrument) { conditions.push("instrument = $instrument"); params.$instrument = instrument; }
@@ -246,11 +244,10 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
       query += " ORDER BY timestamp ASC LIMIT 10000";
 
-      const rows = exportDb.prepare(query).all(params) as Array<{
+      const rows = sqlite.prepare(query).all(params) as Array<{
         source: string; instrument: string; timeframe: string;
         timestamp: number; open: number; high: number; low: number; close: number; volume: number;
       }>;
-      exportDb.close();
 
       if (format === "json") {
         const body = JSON.stringify({ count: rows.length, bars: rows }, null, 2);
