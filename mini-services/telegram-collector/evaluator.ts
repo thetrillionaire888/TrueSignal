@@ -69,14 +69,13 @@ function toDukascopyInstrument(instrument: string): string | null {
  *   - ISO 8601 strings (e.g. "2024-07-08T15:20:00.000Z") — the default
  * Falls back to NaN on garbage input (caller should treat NaN as "now").
  */
-function parseDbDate(s: string): number {
-  if (typeof s === "number") return s;
-  if (!s) return NaN;
-  // Pure-digit string → epoch millis (assume ms; if it's a 10-digit number
-  // it's likely seconds, but our DB stores ms so we don't try to detect).
-  if (/^\d+$/.test(s)) return Number(s);
+function parseDbDate(s: string): Date {
+  if (typeof s === "number") return new Date(s);
+  if (!s) return new Date(NaN);
+  // Pure-digit string → epoch millis
+  if (/^\d+$/.test(s)) return new Date(Number(s));
   const t = Date.parse(s);
-  return Number.isNaN(t) ? NaN : t;
+  return Number.isNaN(t) ? new Date(NaN) : new Date(t);
 }
 
 type EntryType = "stop" | "limit" | "market" | "range";
@@ -205,7 +204,7 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
   const isLong = signal.action === "long";
   const entryType = extractEntryType(signal.notes);
   const now = new Date().toISOString();
-  const postedAtMs = parseDbDate(signal.postedAt);
+  const postedAtMs = parseDbDate(signal.postedAt).getTime();
 
   const base: Partial<EvalResult> = {
     signalId: signal.signalId,
