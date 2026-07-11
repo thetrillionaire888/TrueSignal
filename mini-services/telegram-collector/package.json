@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "bun index.ts"
+    "dev": "bun index.ts",
+    "start": "bun index.ts",
+    "build": "echo 'Bun runtime — no build step needed'"
   },
   "dependencies": {
     "backtest-kit": "^15.2.0",
+    "drizzle-orm": "^0.45.2",
     "dukascopy-node": "^1.46.4",
     "socket.io": "^4.7.5",
     "teleproto": "^1.227.4"
