@@ -326,11 +326,35 @@ function ImportTab() {
             )}
 
             {result && (
-              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 text-sm">
-                <div className="flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
-                  <CheckCircle2 className="h-4 w-4" />
-                  {isCsv ? 'Import successful' : 'Fetch successful'}
+              <div className={cn(
+                'rounded-lg border p-4 text-sm',
+                result.barsFetched === 0 && result.inserted === 0
+                  ? 'border-amber-500/30 bg-amber-500/5'
+                  : 'border-emerald-500/30 bg-emerald-500/5'
+              )}>
+                <div className={cn(
+                  'flex items-center gap-1.5 font-medium',
+                  result.barsFetched === 0 && result.inserted === 0
+                    ? 'text-amber-700 dark:text-amber-400'
+                    : 'text-emerald-700 dark:text-emerald-400'
+                )}>
+                  {result.barsFetched === 0 && result.inserted === 0 ? (
+                    <AlertCircle className="h-4 w-4" />
+                  ) : (
+                    <CheckCircle2 className="h-4 w-4" />
+                  )}
+                  {isCsv
+                    ? 'Import successful'
+                    : result.barsFetched === 0 && result.inserted === 0
+                      ? 'Fetch returned no new data'
+                      : 'Fetch successful'}
                 </div>
+                {result.barsFetched === 0 && result.inserted === 0 && (
+                  <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                    No bars were fetched from the API. The data source may be unavailable
+                    or the date range has no data. Try a different date range or data source.
+                  </p>
+                )}
                 <div className="mt-2 grid grid-cols-3 gap-3 text-xs">
                   <div>
                     <div className="text-lg font-bold tnum text-foreground">{fmtInt(result.barsFetched)}</div>
