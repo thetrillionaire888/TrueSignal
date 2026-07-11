@@ -24,6 +24,7 @@ import {
   TrendingUp,
   CheckCircle2,
   AlertCircle,
+  Info,
   Loader2,
   BarChart3,
   LineChart,
@@ -664,13 +665,13 @@ function ImportTab() {
             </p>
           </div>
 
-          {/* Large file hint */}
+          {/* Large file hint (static info — no spinner, nothing is loading) */}
           {isLargeFile && csvFile && (
             <div className="flex items-start gap-2 rounded-lg border border-blue-500/30 bg-blue-500/5 p-3 text-xs text-blue-700 dark:text-blue-400">
-              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
               <div>
-                <span className="font-medium">Large file ({fileSizeMb.toFixed(1)} MB)</span> — using
-                streaming upload to avoid memory issues. Progress is reported live below.
+                <span className="font-medium">Large file ({fileSizeMb.toFixed(1)} MB)</span> — will use
+                streaming upload when you click Import. Progress is shown live during import.
               </div>
             </div>
           )}
