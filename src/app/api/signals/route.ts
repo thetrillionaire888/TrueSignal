@@ -14,6 +14,7 @@ export async function GET(req: Request) {
   const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10))
   const pageSize = Math.min(100, Math.max(10, parseInt(searchParams.get('pageSize') || '25', 10)))
   const sort = searchParams.get('sort') || 'postedAt'
+  const sortDir = searchParams.get('sortDir') === 'asc' ? 'asc' : 'desc'
 
   const { signals, total } = await listSignals({
     channelId,
@@ -25,6 +26,7 @@ export async function GET(req: Request) {
     page,
     pageSize,
     sort,
+    sortDir,
   })
 
   return NextResponse.json({

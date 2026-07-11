@@ -81,6 +81,37 @@ export type SignalListFilters = {
   channelId?: string; instrument?: string; outcome?: string
   action?: string; category?: string; q?: string
   page: number; pageSize: number; sort: string
+  sortDir?: 'asc' | 'desc'
+}
+
+// Whitelist of sortable columns → SQL expression. Prevents SQL injection
+// (the sort param never gets interpolated raw — only the direction does,
+// and that is constrained to the literal strings 'ASC' / 'DESC').
+const SORT_COLUMN_MAP: Record<string, string> = {
+  instrument: 's.instrument',
+  channel: 'c.name',
+  action: 's.action',
+  entryPrice: 's.entryPrice',
+  stopLoss: 's.stopLoss',
+  outcome: 'e.outcome',
+  rMultiple: 'e.rMultiple',
+  confidence: 's.confidence',
+  postedAt: 'm.postedAt',
+}
+
+// Columns that may be NULL (unevaluated signals have no Evaluation row).
+// Push NULLs to the end regardless of sort direction so evaluated rows
+// always appear first — more useful than having all the dashes clustered
+// at the top when sorting ascending.
+const NULLABLE_SORT_COLUMNS = new Set(['e.outcome', 'e.rMultiple'])
+
+function buildOrderBy(sort: string, sortDir: 'asc' | 'desc' | undefined): string {
+  const dir = sortDir === 'asc' ? 'ASC' : 'DESC'
+  const col = SORT_COLUMN_MAP[sort] ?? 'm.postedAt'
+  if (NULLABLE_SORT_COLUMNS.has(col)) {
+    return `${col} IS NULL, ${col} ${dir}`
+  }
+  return `${col} ${dir}`
 }
 
 export type SignalListItem = {
@@ -111,9 +142,7 @@ export async function listSignals(filters: SignalListFilters): Promise<{ signals
     params.push(`%${filters.q}%`, `%${filters.q}%`)
   }
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-  let orderBy = 'm.postedAt DESC'
-  if (filters.sort === 'rMultiple' || filters.sort === 'outcome') orderBy = 'e.rMultiple DESC'
-  else if (filters.sort === 'confidence') orderBy = 's.confidence DESC'
+  const orderBy = buildOrderBy(filters.sort, filters.sortDir)
 
   const totalRow = sqlite.prepare(`SELECT COUNT(*) as c FROM Signal s JOIN catalog.Channel c ON s.channelId = c.id LEFT JOIN Message m ON s.messageId = m.id LEFT JOIN Evaluation e ON e.signalId = s.id ${whereClause}`).get(...params) as { c: number }
 

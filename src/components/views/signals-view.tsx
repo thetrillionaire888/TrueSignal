@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { fmtPrice, fmtDate, parseTPs, fmtCompact, CATEGORY_META } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ArrowUpDown } from 'lucide-react'
+import { Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
 
 type SignalRow = {
   id: string
@@ -46,6 +46,75 @@ type SignalRow = {
 
 type SignalsResp = { signals: SignalRow[]; total: number; page: number; pageSize: number; totalPages: number }
 
+// Sortable column config — TPs is excluded because it's a variable-length
+// JSON list and has no meaningful sort order.
+type SortColumn = {
+  key: string
+  label: string
+  align: 'left' | 'right'
+  defaultDir: 'asc' | 'desc'
+}
+
+// Header layout: each entry is either a sortable column or a plain label.
+// Order here matches the <td> order in the table body.
+type HeaderCell =
+  | { kind: 'sort'; col: SortColumn }
+  | { kind: 'static'; label: string; align: 'left' | 'right' }
+
+const HEADER_CELLS: HeaderCell[] = [
+  { kind: 'sort', col: { key: 'instrument', label: 'Instrument', align: 'left', defaultDir: 'asc' } },
+  { kind: 'sort', col: { key: 'channel', label: 'Channel', align: 'left', defaultDir: 'asc' } },
+  { kind: 'sort', col: { key: 'action', label: 'Dir', align: 'left', defaultDir: 'asc' } },
+  { kind: 'sort', col: { key: 'entryPrice', label: 'Entry', align: 'right', defaultDir: 'desc' } },
+  { kind: 'sort', col: { key: 'stopLoss', label: 'SL', align: 'right', defaultDir: 'desc' } },
+  { kind: 'static', label: 'TPs', align: 'right' },
+  { kind: 'sort', col: { key: 'outcome', label: 'Outcome', align: 'left', defaultDir: 'asc' } },
+  { kind: 'sort', col: { key: 'rMultiple', label: 'R', align: 'right', defaultDir: 'desc' } },
+  { kind: 'sort', col: { key: 'postedAt', label: 'Posted', align: 'left', defaultDir: 'desc' } },
+]
+
+function SortableTh({ col }: { col: SortColumn }) {
+  const { filters, setSort } = useUI()
+  const isActive = filters.sort === col.key
+  const dir = filters.sortDir
+  const onClick = () => {
+    if (isActive) {
+      setSort(col.key, dir === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSort(col.key, col.defaultDir)
+    }
+  }
+  return (
+    <th
+      className={cn(
+        'cursor-pointer select-none px-3 py-2.5 font-medium transition-colors hover:text-foreground',
+        col.align === 'right' ? 'text-right' : 'text-left',
+        isActive && 'text-foreground'
+      )}
+      onClick={onClick}
+      title={`Sort by ${col.label}`}
+    >
+      <span
+        className={cn(
+          'inline-flex items-center gap-1',
+          col.align === 'right' && 'flex-row-reverse'
+        )}
+      >
+        {col.label}
+        {isActive ? (
+          dir === 'asc' ? (
+            <ArrowUp className="h-3 w-3" />
+          ) : (
+            <ArrowDown className="h-3 w-3" />
+          )
+        ) : (
+          <ArrowUpDown className="h-3 w-3 opacity-40" />
+        )}
+      </span>
+    </th>
+  )
+}
+
 export function SignalsView() {
   const { filters, setFilter, resetFilters, openSignal } = useUI()
   const [showFilters, setShowFilters] = React.useState(true)
@@ -64,6 +133,7 @@ export function SignalsView() {
     page: String(filters.page),
     pageSize: String(filters.pageSize),
     sort: filters.sort,
+    sortDir: filters.sortDir,
   })
   if (filters.channelId) params.set('channelId', filters.channelId)
   if (filters.instrument) params.set('instrument', filters.instrument)
@@ -197,22 +267,21 @@ export function SignalsView() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border/60 bg-muted/30 text-left text-[11px] uppercase tracking-wider text-muted-foreground">
-                <th className="px-3 py-2.5 font-medium">Instrument</th>
-                <th className="px-3 py-2.5 font-medium">Channel</th>
-                <th className="px-3 py-2.5 font-medium">Dir</th>
-                <th className="px-3 py-2.5 text-right font-medium">Entry</th>
-                <th className="px-3 py-2.5 text-right font-medium">SL</th>
-                <th className="px-3 py-2.5 text-right font-medium">TPs</th>
-                <th className="px-3 py-2.5 font-medium">Outcome</th>
-                <th
-                  className="cursor-pointer px-3 py-2.5 text-right font-medium hover:text-foreground"
-                  onClick={() => setFilter('sort', 'rMultiple')}
-                >
-                  <span className="inline-flex items-center gap-1">
-                    R <ArrowUpDown className="h-3 w-3" />
-                  </span>
-                </th>
-                <th className="px-3 py-2.5 font-medium">Posted</th>
+                {HEADER_CELLS.map((cell, i) =>
+                  cell.kind === 'sort' ? (
+                    <SortableTh key={cell.col.key} col={cell.col} />
+                  ) : (
+                    <th
+                      key={`static-${i}`}
+                      className={cn(
+                        'px-3 py-2.5 font-medium',
+                        cell.align === 'right' ? 'text-right' : 'text-left'
+                      )}
+                    >
+                      {cell.label}
+                    </th>
+                  )
+                )}
               </tr>
             </thead>
             <tbody>

@@ -14,6 +14,7 @@ type SignalFilters = {
   page: number
   pageSize: number
   sort: string
+  sortDir: 'asc' | 'desc'
 }
 
 type UIState = {
@@ -31,6 +32,7 @@ type UIState = {
   closeChannel: () => void
   setMobileNav: (open: boolean) => void
   setFilter: <K extends keyof SignalFilters>(key: K, value: SignalFilters[K]) => void
+  setSort: (column: string, dir: 'asc' | 'desc') => void
   resetFilters: () => void
 }
 
@@ -44,6 +46,7 @@ const defaultFilters: SignalFilters = {
   page: 1,
   pageSize: 25,
   sort: 'postedAt',
+  sortDir: 'desc',
 }
 
 export const useUI = create<UIState>((set) => ({
@@ -62,5 +65,7 @@ export const useUI = create<UIState>((set) => ({
   setMobileNav: (open) => set({ mobileNavOpen: open }),
   setFilter: (key, value) =>
     set((s) => ({ filters: { ...s.filters, [key]: value, page: key === 'page' ? (value as number) : 1 } })),
+  setSort: (column, dir) =>
+    set((s) => ({ filters: { ...s.filters, sort: column, sortDir: dir, page: 1 } })),
   resetFilters: () => set({ filters: defaultFilters }),
 }))
