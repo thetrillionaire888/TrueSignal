@@ -19,6 +19,15 @@ const stmts = {
   clearIngestState: sqlite.prepare(
     "DELETE FROM catalog.IngestState WHERE channelId = $channelId"
   ),
+  // Get the oldest stored message ID for a channel — used to skip already-ingested
+  // messages when re-ingesting "all history" after a stop.
+  getOldestMessageId: sqlite.prepare(
+    "SELECT MIN(telegramMessageId) as minId FROM Message WHERE channelId = $channelId"
+  ),
+  // Count how many messages are already stored for a channel
+  countMessages: sqlite.prepare(
+    "SELECT COUNT(*) as c FROM Message WHERE channelId = $channelId"
+  ),
 };
 
 export type IngestionControlState = "running" | "paused" | "stopped" | "idle";
@@ -150,4 +159,27 @@ export function getResumePosition(channelId: string): { offsetId: number; fetche
 
 export function clearResumePosition(channelId: string) {
   stmts.clearIngestState.run({ $channelId: channelId });
+}
+
+/**
+ * Get the oldest stored telegramMessageId for a channel.
+ * Used to skip already-ingested messages when re-ingesting "all history".
+ *
+ * When a user stops ingestion and re-starts "all history", instead of
+ * re-fetching from the newest message (wasting bandwidth on messages
+ * already in the DB), we use this as the resume offsetId — Telegram's
+ * GetHistory with offsetId=X returns messages older than X.
+ */
+export function getOldestStoredMessageId(channelId: string): number | null {
+  const row = stmts.getOldestMessageId.get({ $channelId: channelId }) as { minId: number | null } | null;
+  if (!row || row.minId == null) return null;
+  return row.minId;
+}
+
+/**
+ * Count stored messages for a channel.
+ */
+export function countStoredMessages(channelId: string): number {
+  const row = stmts.countMessages.get({ $channelId: channelId }) as { c: number };
+  return row.c;
 }

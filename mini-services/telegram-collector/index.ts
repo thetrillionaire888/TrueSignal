@@ -21,6 +21,8 @@ import {
   getIngestionStatus,
   getResumePosition,
   clearResumePosition,
+  getOldestStoredMessageId,
+  countStoredMessages,
   type IngestionStatus,
 } from "./ingestion-state";
 import {
@@ -458,9 +460,37 @@ async function ingestAsync(
     verified: resolved.verified,
   });
 
-  // Check for resume position
+  // ── Smart resume: skip already-stored messages ────────────────────────────
+  // When re-ingesting "all history" (limit=0) after a stop, we don't want to
+  // re-fetch messages that are already in the DB. Telegram's GetHistory walks
+  // from newest → oldest. By setting offsetId to the oldest stored message ID,
+  // we tell Telegram "start from here, go older" — skipping all stored messages.
+  //
+  // Priority for resume offsetId:
+  //   1. Saved IngestState resume position (from a stopped ingestion)
+  //   2. Oldest stored message ID (skip already-ingested messages)
+  //   3. 0 (start from newest — first ingestion)
+  let resumeOffsetId: number | undefined;
   const resumePos = getResumePosition(channelRecord.id);
-  const resumeOffsetId = resumePos?.offsetId;
+  const storedCount = countStoredMessages(channelRecord.id);
+
+  if (resumePos?.offsetId && resumePos.offsetId > 0) {
+    // Case 1: Resume from saved position (stopped ingestion)
+    resumeOffsetId = resumePos.offsetId;
+  } else if (limit === 0 && storedCount > 0) {
+    // Case 2: Re-ingesting "all history" but already have messages —
+    // skip them by starting from the oldest stored message
+    const oldestId = getOldestStoredMessageId(channelRecord.id);
+    if (oldestId && oldestId > 0) {
+      resumeOffsetId = oldestId;
+    }
+  }
+  // Case 3: First ingestion or limit > 0 — resumeOffsetId stays undefined
+
+  // Clear stale resume position if we're using smart-skip instead
+  if (resumeOffsetId && !resumePos?.offsetId) {
+    clearResumePosition(channelRecord.id);
+  }
 
   // Start tracking the job for pause/stop/resume
   startJob(jobId, channelRecord.id, channelRecord.name);
@@ -470,7 +500,9 @@ async function ingestAsync(
     jobId,
     phase: "fetching",
     message: resumeOffsetId
-      ? `Resuming from message #${resumeOffsetId}… Fetching ${limitLabel} messages.`
+      ? storedCount > 0 && !resumePos?.offsetId
+        ? `Smart resume: skipping ${storedCount} already-stored messages, fetching older history from #${resumeOffsetId}…`
+        : `Resuming from message #${resumeOffsetId}… Fetching ${limitLabel} messages.`
       : `Fetching ${limitLabel} messages from channel history…`,
     channelId: channelRecord.id,
   });
