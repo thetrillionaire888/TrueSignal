@@ -211,9 +211,12 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
           return json(res, 400, { error: `Cannot map ${signal.instrument} to Dukascopy instrument` });
         }
 
-        // Fetch bars with retry (48h window from signal post time)
+        // Fetch bars with retry (48h window from signal post time).
+        // forceRefresh=true bypasses the cache-hit optimization so we always
+        // try Dukascopy — important for re-evaluating 'no_data' signals where
+        // new bars may have become available since the first eval attempt.
         const signalTime = parseDbDate(signal.postedAt);
-        const { bars, stats } = await fetchBars(dukascopyInstrument, signalTime, 48);
+        const { bars, stats } = await fetchBars(dukascopyInstrument, signalTime, 48, undefined, true);
 
         // Delete old evaluation
         sqlite.prepare("DELETE FROM Evaluation WHERE signalId = ?").run(signalId);

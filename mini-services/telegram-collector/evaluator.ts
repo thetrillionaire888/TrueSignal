@@ -138,7 +138,7 @@ const stmts = {
      FROM Signal s
      JOIN Message m ON s.messageId = m.id
      LEFT JOIN Evaluation e ON e.signalId = s.id
-     WHERE e.signalId IS NULL
+     WHERE e.signalId IS NULL OR e.outcome = 'no_data'
      ORDER BY m.postedAt ASC`
   ),
   getUnevaluatedByChannel: sqlite.prepare(
@@ -148,7 +148,7 @@ const stmts = {
      FROM Signal s
      JOIN Message m ON s.messageId = m.id
      LEFT JOIN Evaluation e ON e.signalId = s.id
-     WHERE e.signalId IS NULL AND s.channelId = $channelId
+     WHERE (e.signalId IS NULL OR e.outcome = 'no_data') AND s.channelId = $channelId
      ORDER BY m.postedAt ASC`
   ),
   insertEvaluation: sqlite.prepare(
@@ -183,10 +183,11 @@ export async function fetchBars(
   instrument: string,
   fromTime: Date,
   hoursForward: number,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  forceRefresh: boolean = false
 ): Promise<{ bars: Bar[]; stats: CacheStats }> {
   const toTime = new Date(fromTime.getTime() + hoursForward * 3600000);
-  return fetchBarsCached(instrument, "m15", fromTime, toTime, onProgress);
+  return fetchBarsCached(instrument, "m15", fromTime, toTime, onProgress, forceRefresh);
 }
 
 // ── Evaluate a single signal against historical bars ────────────────────────

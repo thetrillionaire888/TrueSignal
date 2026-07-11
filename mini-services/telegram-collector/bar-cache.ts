@@ -96,13 +96,19 @@ function batchInsertBars(
  * Fetch OHLC bars with read-through caching.
  * Returns bars for [fromTime, toTime) at the given timeframe.
  * Checks the DB cache first; only fetches missing bars from Dukascopy.
+ *
+ * Pass forceRefresh=true to bypass the cache-hit optimization and always
+ * try fetching from Dukascopy. This is useful when re-evaluating 'no_data'
+ * signals — the cache may have partial/stale data, and we want to pick up
+ * any newly-available bars.
  */
 export async function fetchBarsCached(
   instrument: string,
   timeframe: string,
   fromTime: Date,
   toTime: Date,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  forceRefresh: boolean = false
 ): Promise<{ bars: Bar[]; stats: CacheStats }> {
   const fromMs = fromTime.getTime();
   const toMs = toTime.getTime();
@@ -121,7 +127,10 @@ export async function fetchBarsCached(
   // Dukascopy doesn't return bars for weekends/market-closed periods, so the
   // actual count is always lower than the theoretical max. We treat any
   // non-zero cached count as a hit (the data was already fetched).
-  if (cachedCount > 0) {
+  //
+  // Skip this optimization when forceRefresh=true — the caller explicitly
+  // wants fresh data (e.g. re-evaluating a 'no_data' signal).
+  if (!forceRefresh && cachedCount > 0) {
     const cachedBars = (stmts.getCachedRange.all({
       $instrument: instrument,
       $timeframe: timeframe,
