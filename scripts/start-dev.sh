@@ -4,8 +4,10 @@
 # Starts Next.js + Telegram Collector + Caddy gateway in separate terminals.
 #
 # Usage:
-#   bash scripts/start-dev.sh          # uses tmux (recommended)
-#   bash scripts/start-dev.sh --split  # uses OS-native split terminals
+#   bash scripts/start-dev.sh            # uses tmux (recommended)
+#   bash scripts/start-dev.sh --split     # uses OS-native split terminals
+#   bash scripts/start-dev.sh --force     # kill any process on ports 3000/3001/81 first
+#   bash scripts/start-dev.sh --force --split  # combine options
 #
 # Prerequisites:
 #   - Bun (https://bun.sh/)
@@ -21,6 +23,31 @@
 #   (or pkill -f "next dev"; pkill -f "bun.*index.ts"; caddy stop)
 
 set -euo pipefail
+
+# ── Parse CLI flags ──────────────────────────────────────────────────────────
+FORCE=false
+MODE="--tmux"
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) FORCE=true ;;
+    --split|-s) MODE="--split" ;;
+    --tmux|-t)  MODE="--tmux" ;;
+    --help|-h)
+      echo "Usage: bash scripts/start-dev.sh [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --force, -f    Kill any process occupying ports 3000, 3001, 81 before starting"
+      echo "  --split, -s    Use OS-native split terminals instead of tmux"
+      echo "  --tmux,  -t    Use tmux (default)"
+      echo "  --help,  -h    Show this help message"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg (use --help for usage)"
+      exit 1
+      ;;
+  esac
+done
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -90,6 +117,8 @@ echo ""
 
 # ── Kill any existing instances ──────────────────────────────────────────────
 echo -e "${YELLOW}Stopping any existing services...${NC}"
+
+# Standard pkill for known process patterns
 pkill -f "next dev" 2>/dev/null || true
 pkill -f "next-server" 2>/dev/null || true
 pkill -f "bun.*index.ts" 2>/dev/null || true
@@ -97,7 +126,59 @@ if [ "$USE_CADDY" = true ]; then
   caddy stop --config "$PROJECT_ROOT/Caddyfile" 2>/dev/null || true
 fi
 sleep 1
-echo -e "  ${GREEN}✓${NC} Clean slate"
+
+# ── Force mode: kill ANY process on our ports ───────────────────────────────
+# Handles cases where:
+#   - A process from an unclean exit is still holding the port
+#   - Another service is using the same port
+#   - A zombie process won't respond to pkill
+if [ "$FORCE" = true ]; then
+  echo -e "${YELLOW}Force mode: killing any process on ports 3000, 3001, 81...${NC}"
+
+  kill_port() {
+    local port=$1
+    local pids=""
+
+    # Try lsof (macOS + most Linux)
+    if command -v lsof &>/dev/null; then
+      pids=$(lsof -ti ":$port" 2>/dev/null || true)
+    fi
+
+    # Fallback to fuser (some Linux distros)
+    if [ -z "$pids" ] && command -v fuser &>/dev/null; then
+      pids=$(fuser "$port/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -v '^$' || true)
+    fi
+
+    # Fallback to ss + awk (minimal Linux)
+    if [ -z "$pids" ] && command -v ss &>/dev/null; then
+      pids=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K\d+' || true)
+    fi
+
+    if [ -n "$pids" ]; then
+      for pid in $pids; do
+        echo -e "  ${RED} killing PID $pid on port $port${NC}"
+        kill -9 "$pid" 2>/dev/null || true
+      done
+      sleep 1
+    else
+      echo -e "  ${GREEN}✓${NC} port $port is free"
+    fi
+  }
+
+  kill_port 3000
+  kill_port 3001
+  if [ "$USE_CADDY" = true ]; then
+    kill_port 81
+  fi
+
+  # Also kill the tmux session if it still exists
+  tmux kill-session -t truesignal 2>/dev/null || true
+
+  echo -e "  ${GREEN}✓${NC} All ports cleared"
+else
+  echo -e "  ${GREEN}✓${NC} Clean slate"
+  echo -e "  ${YELLOW}  Tip: use --force to kill any process occupying ports 3000/3001/81${NC}"
+fi
 echo ""
 
 # ── Start services ───────────────────────────────────────────────────────────
@@ -124,7 +205,6 @@ start_caddy() {
 }
 
 # ── Launch method ────────────────────────────────────────────────────────────
-MODE="${1:---tmux}"
 
 if [ "$MODE" = "--split" ]; then
   # ── OS-native split terminals ─────────────────────────────────────────────
