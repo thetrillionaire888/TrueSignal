@@ -466,20 +466,44 @@ function ImportTab() {
         formData.append('file', csvFile)
 
         const params = new URLSearchParams({
-          XTransformPort: '3001',
           instrument,
           source,
           timeframe,
         })
+        // Call the Next.js route handler which streams the request to the
+        // collector (avoids the rewrite proxy buffering the entire body).
         const res = await fetch(`/api/import-csv-stream?${params}`, {
           method: 'POST',
           body: formData,
         })
-        const data = await res.json().catch(() => ({ error: 'invalid response' }))
-        if (!res.ok) {
-          throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`)
+        // Read the response as text first, then try to parse as JSON.
+        // This avoids confusing "invalid response" errors when the proxy
+        // returns an HTML error page or an unexpected content type.
+        const responseText = await res.text()
+        let data: unknown
+        try {
+          data = JSON.parse(responseText)
+        } catch {
+          // Response is not JSON — could be an HTML error page from the proxy
+          throw new Error(
+            `Server returned ${res.status} ${res.statusText}. ` +
+            `Response was not JSON (first 200 chars): ${responseText.slice(0, 200)}`
+          )
         }
-        setResult(data as typeof result)
+        if (!res.ok) {
+          const errMsg = (data as { error?: string }).error ?? `HTTP ${res.status} ${res.statusText}`
+          throw new Error(errMsg)
+        }
+        // Validate the response shape — the streaming endpoint must return
+        // at least parsedBars + inserted + skipped.
+        const parsed = data as { parsedBars?: number; inserted?: number; skipped?: number }
+        if (typeof parsed.parsedBars !== 'number' || typeof parsed.inserted !== 'number') {
+          throw new Error(
+            `Unexpected response from server. Expected {parsedBars, inserted, skipped} but got: ` +
+            JSON.stringify(data).slice(0, 300)
+          )
+        }
+        setResult(parsed as NonNullable<typeof result>)
       } else {
         // ── JSON endpoint for pasted CSV (small data, no streaming needed) ─
         if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
@@ -728,19 +752,21 @@ function ImportTab() {
                 <div className="flex-1">
                   <span className="font-medium">Import successful!</span>
                   <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-0.5 sm:grid-cols-4">
-                    <span>Parsed: <span className="font-medium">{result.parsedBars.toLocaleString()}</span> bars</span>
-                    <span>Inserted: <span className="font-medium">{result.inserted.toLocaleString()}</span></span>
-                    <span>Skipped (existing): <span className="font-medium">{result.skipped.toLocaleString()}</span></span>
-                    <span>Source TF: <span className="font-medium">{result.sourceTimeframe}</span></span>
+                    <span>Parsed: <span className="font-medium">{(result.parsedBars ?? 0).toLocaleString()}</span> bars</span>
+                    <span>Inserted: <span className="font-medium">{(result.inserted ?? 0).toLocaleString()}</span></span>
+                    <span>Skipped (existing): <span className="font-medium">{(result.skipped ?? 0).toLocaleString()}</span></span>
+                    <span>Source TF: <span className="font-medium">{result.sourceTimeframe ?? 'unknown'}</span></span>
                   </div>
                   {result.aggregated && result.aggregationNote && (
                     <div className="mt-1">
                       <span className="font-medium">Aggregated:</span> {result.aggregationNote}
                     </div>
                   )}
-                  <div className="mt-1">
-                    Date range: <span className="font-medium">{result.dateRange.from}</span> → <span className="font-medium">{result.dateRange.to}</span>
-                  </div>
+                  {result.dateRange && (
+                    <div className="mt-1">
+                      Date range: <span className="font-medium">{result.dateRange.from ?? '—'}</span> → <span className="font-medium">{result.dateRange.to ?? '—'}</span>
+                    </div>
+                  )}
                   <div className="mt-1">
                     Stored in: <code className="rounded bg-emerald-500/10 px-1 py-0.5">{result.instrument}_{result.timeframe}.db</code> (source: <code className="rounded bg-emerald-500/10 px-1 py-0.5">{result.source}</code>)
                   </div>
