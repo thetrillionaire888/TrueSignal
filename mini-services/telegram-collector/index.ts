@@ -174,8 +174,11 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       return json(res, 200, { jobId, message: "Evaluation started", channelId });
     }
 
-    // ── Re-parse messages for a channel (multi-stage parser + correlator) ──
-    if (path === "/api/reparse" && req.method === "POST") {
+    // ── Parse messages for a channel (multi-stage parser + correlator) ──────
+    // Clears old signals/evaluations, re-parses all messages, then runs the
+    // order-ID correlator for multi-message signals. Idempotent — safe to
+    // call multiple times.
+    if (path === "/api/parse" && req.method === "POST") {
       const channelId = (body.channelId as string) || null;
       if (!channelId) return json(res, 400, { error: "channelId is required" });
 

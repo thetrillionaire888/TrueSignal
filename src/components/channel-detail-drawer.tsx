@@ -81,7 +81,7 @@ export function ChannelDetailDrawer() {
     setReparseStatus({ loading: true })
     setReevalStatus({})
     try {
-      const result = await collectorFetch<any>('/api/reparse', {
+      const result = await collectorFetch<any>('/api/parse', {
         method: 'POST', json: { channelId: selectedChannelId },
       })
       setReparseStatus({ loading: false, result })
