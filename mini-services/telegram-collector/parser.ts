@@ -44,11 +44,19 @@ function detectAction(text: string): ActionMatch {
 const NUM = "([\\d,]+(?:\\.\\d+)?)";
 const SL_RE = new RegExp("(?:stop\\s*loss|stoploss|\\bsl\\b|invalidation|stop\\s*l)\\s*[:\\-]?\\s*\\$?\\s*" + NUM, "i");
 const TP_LIST_RE = new RegExp("(?:targets?|take\\s*profits?|tps?)\\s*[:\\-]\\s*([\\d,\\s.]+)", "i");
-const TP_RE = new RegExp("(?:take\\s*profit|\\btp\\d*|target|t\\.p\\.?)\\s*(?:\\d+\\s*[:\\-]?)?\\s*\\$?\\s*" + NUM, "gi");
+// TP_RE: matches "TP 4105", "TP1: 4105", "TP1 - 4105", "Take Profit 4105", etc.
+// The optional separator [:\\-]? after the keyword handles both "TP 4105" (space only)
+// and "TP1: 4105" (colon). Removed the buggy (?:\\d+\\s*[:\\-]?)? group that was
+// greedily eating the price as a TP level number.
+const TP_RE = new RegExp("(?:take\\s*profit|\\btp\\d*|target|t\\.p\\.?)\\s*[:\\-]?\\s*\\$?\\s*" + NUM, "gi");
 const ENTRY_KEYWORD_RE = new RegExp("(?:entry(?:\\s+(?:sell|buy))?(?:\\s+(?:limit|stop|zone))?|enters?|buy\\s*at|sell\\s*at|ref\\s*price)\\s*[:\\-]?\\s*\\$?\\s*" + NUM, "i");
 const RANGE_KEYWORD_RE = new RegExp("(?:sell|buy)?\\s*(?:range|zone)\\s*[:\\-]?\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
 const ACTION_PRICE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM, "i");
 const ACTION_RANGE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
+// ACTION_TWO_NUMBERS_RE: matches "BUY 4099 4095" — two numbers after the action
+// keyword, separated by whitespace. This is a common signal format for range entries
+// where the two numbers are the entry range bounds (e.g. BUY high low or BUY low high).
+const ACTION_TWO_NUMBERS_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM + "\\s+" + NUM, "i");
 const AT_RANGE_RE = new RegExp("@\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
 const AT_SINGLE_RE = new RegExp("@\\s*\\$?\\s*" + NUM, "i");
 const TP_OPEN_RE = /\btp\s*[:\-]?\s*open\b/i;
@@ -118,10 +126,13 @@ function parseStage1(lines: string[], text: string, instrument: string, instrume
 // Stage 2: Action-anchored
 function parseStage2(lines: string[], text: string, instrument: string, instrumentType: string, action: "long" | "short", entryType: EntryType): ParsedSignal | null {
   let entryPrice = 0, entryLow: number | null = null, entryHigh: number | null = null, isRange = false;
+  // Try range formats first (more specific than single-price)
   for (const line of lines) { const m = line.match(ACTION_RANGE_RE); if (m) { const lo = parseNumber(m[1]), hi = parseNumber(m[2]); if (isFinite(lo) && isFinite(hi) && lo > 0 && hi > 0) { entryLow = Math.min(lo,hi); entryHigh = Math.max(lo,hi); entryPrice = (entryLow+entryHigh)/2; isRange = true; entryType = "range"; break; } } }
   if (!isRange) { for (const line of lines) { const m = line.match(AT_RANGE_RE); if (m) { const lo = parseNumber(m[1]), hi = parseNumber(m[2]); if (isFinite(lo) && isFinite(hi) && lo > 0 && hi > 0) { entryLow = Math.min(lo,hi); entryHigh = Math.max(lo,hi); entryPrice = (entryLow+entryHigh)/2; isRange = true; entryType = "range"; break; } } } }
+  // Try "BUY 4099 4095" format — two numbers after action keyword (space-separated range)
+  if (!isRange) { for (const line of lines) { const m = line.match(ACTION_TWO_NUMBERS_RE); if (m) { const lo = parseNumber(m[1]), hi = parseNumber(m[2]); if (isFinite(lo) && isFinite(hi) && lo > 0 && hi > 0) { entryLow = Math.min(lo,hi); entryHigh = Math.max(lo,hi); entryPrice = (entryLow+entryHigh)/2; isRange = true; entryType = "range"; break; } } } }
   if (!isRange) { for (const line of lines) { const m = line.match(ACTION_PRICE_RE); if (m) { const v = parseNumber(m[1]); if (isFinite(v) && v > 0) { entryPrice = v; break; } } } }
-  if (!isRange && entryPrice === 0) { for (const line of lines) { const m = line.match(AT_SINGLE_RE); if (m) { const v = parseNumber(m[1]); if (isFinite(v) && v > 0) { entryPrice = v; break; } } } }
+  if (!isRange) { for (const line of lines) { const m = line.match(AT_SINGLE_RE); if (m) { const v = parseNumber(m[1]); if (isFinite(v) && v > 0) { entryPrice = v; break; } } } }
   if (!isRange && entryPrice === 0) return null;
   const stopLoss = extractStopLoss(lines); if (stopLoss === null) return null;
   if (!validateSides(action, entryPrice, stopLoss)) return null;
