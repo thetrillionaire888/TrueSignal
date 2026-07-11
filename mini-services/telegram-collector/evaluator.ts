@@ -55,7 +55,7 @@ const INSTRUMENT_MAP: Record<string, string> = {
   brent: "brent",
 };
 
-function toDukascopyInstrument(instrument: string): string | null {
+export function toDukascopyInstrument(instrument: string): string | null {
   const key = instrument.toLowerCase().replace(/z$/, ""); // strip 'z' suffix
   return INSTRUMENT_MAP[key] ?? null;
 }
@@ -69,7 +69,7 @@ function toDukascopyInstrument(instrument: string): string | null {
  *   - ISO 8601 strings (e.g. "2024-07-08T15:20:00.000Z") — the default
  * Falls back to NaN on garbage input (caller should treat NaN as "now").
  */
-function parseDbDate(s: string): Date {
+export function parseDbDate(s: string): Date {
   if (typeof s === "number") return new Date(s);
   if (!s) return new Date(NaN);
   // Pure-digit string → epoch millis
@@ -95,7 +95,7 @@ function extractEntryType(notes: string | null | undefined): EntryType {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-type SignalRow = {
+export type SignalRow = {
   signalId: string;
   messageId: string;
   channelId: string;
@@ -179,7 +179,7 @@ const stmts = {
 // ── Fetch historical bars (with DB caching) ──────────────────────────────────
 // Uses the read-through cache in bar-cache.ts: checks SQLite first, only
 // fetches missing bars from Dukascopy, and stores them for future reuse.
-async function fetchBars(
+export async function fetchBars(
   instrument: string,
   fromTime: Date,
   hoursForward: number,
@@ -197,7 +197,7 @@ async function fetchBars(
 //   - stop:    buy when bar.high ≥ entry; sell when bar.low ≤ entry
 //   - range:   walk forward to first range-touch; conservative fill at edge
 //              closest to SL (worst-case R)
-function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
+export function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
   const tps = JSON.parse(signal.takeProfits) as number[];
   const tp = tps.length > 0 ? tps[0] : null; // evaluate against first TP
   const sl = signal.stopLoss;
@@ -456,7 +456,7 @@ function evaluateSignal(signal: SignalRow, bars: Bar[]): EvalResult {
 }
 
 // ── Save evaluation to DB (single-row helper, used outside batches) ─────────
-function saveEvaluation(result: EvalResult) {
+export function saveEvaluation(result: EvalResult) {
   stmts.insertEvaluation.run({
     $id: cuid(),
     $signalId: result.signalId,

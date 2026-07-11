@@ -176,6 +176,68 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       return json(res, 200, { jobId, message: "Evaluation started", channelId });
     }
 
+    // ── Re-evaluate a single signal by ID ───────────────────────────────────
+    // Fetches fresh bars from Dukascopy (with retry), evaluates, and replaces
+    // the existing Evaluation record. Used when the user wants to re-check a
+    // signal — especially 'no_data' outcomes caused by Dukascopy socket errors.
+    if (path === "/api/evaluate-signal" && req.method === "POST") {
+      const signalId = (body.signalId as string) || null;
+      if (!signalId) return json(res, 400, { error: "signalId is required" });
+
+      try {
+        const { evaluateSignal, extractEntryType, parseDbDate, toDukascopyInstrument, fetchBars, saveEvaluation, EvalResult, SignalRow } = {
+          evaluateSignal: (await import("./evaluator")).evaluateSignal,
+          extractEntryType: (await import("./evaluator")).extractEntryType,
+          parseDbDate: (await import("./evaluator")).parseDbDate,
+          toDukascopyInstrument: (await import("./evaluator")).toDukascopyInstrument,
+          fetchBars: (await import("./evaluator")).fetchBars,
+          saveEvaluation: (await import("./evaluator")).saveEvaluation,
+        };
+
+        // Get the signal + its message
+        const signal = sqlite.prepare(`
+          SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
+                 s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss,
+                 s.takeProfits, s.notes, m.postedAt
+          FROM Signal s
+          JOIN Message m ON s.messageId = m.id
+          WHERE s.id = ?
+        `).get(signalId) as any;
+
+        if (!signal) return json(res, 404, { error: "Signal not found" });
+
+        const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
+        if (!dukascopyInstrument) {
+          return json(res, 400, { error: `Cannot map ${signal.instrument} to Dukascopy instrument` });
+        }
+
+        // Fetch bars with retry (48h window from signal post time)
+        const signalTime = parseDbDate(signal.postedAt);
+        const { bars, stats } = await fetchBars(dukascopyInstrument, signalTime, 48);
+
+        // Delete old evaluation
+        sqlite.prepare("DELETE FROM Evaluation WHERE signalId = ?").run(signalId);
+
+        // Re-evaluate
+        const result = evaluateSignal(signal, bars);
+        saveEvaluation(result);
+
+        return json(res, 200, {
+          signalId,
+          outcome: result.outcome,
+          exitPrice: result.exitPrice,
+          exitReason: result.exitReason,
+          rMultiple: result.rMultiple,
+          barsAnalyzed: result.barsAnalyzed,
+          barsCached: stats.cached,
+          barsFetched: stats.fetched,
+          message: `Re-evaluated: ${result.outcome} (R=${result.rMultiple}, ${bars.length} bars, ${stats.cached} cached / ${stats.fetched} fetched)`,
+        });
+      } catch (e) {
+        return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     // ── Parse messages for a channel (multi-stage parser + correlator) ──────
     // Clears old signals/evaluations, re-parses all messages, then runs the
     // order-ID correlator for multi-message signals. Idempotent — safe to

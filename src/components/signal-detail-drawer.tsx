@@ -1,12 +1,14 @@
 'use client'
 
 import * as React from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { ActionBadge, OutcomeBadge, RMultiple } from '@/components/badges'
 import { ChannelAvatar, VerifiedTick } from '@/components/channel-avatar'
 import { useUI } from '@/lib/store'
+import { collectorFetch } from '@/lib/collector-client'
 import { fmtPrice, fmtPct, fmtDuration, fmtDateTime, parseTPs, fmtInt, CATEGORY_META } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
@@ -23,6 +25,9 @@ import {
   XCircle,
   ArrowDownRight,
   ArrowUpRight,
+  RefreshCw,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react'
 
 type Detail = {
@@ -85,11 +90,32 @@ type Detail = {
 
 export function SignalDetailDrawer() {
   const { detailOpen, selectedSignalId, closeSignal, openChannel } = useUI()
+  const qc = useQueryClient()
   const { data, isLoading } = useQuery<Detail>({
     queryKey: ['signal', selectedSignalId],
     queryFn: async () => (await fetch(`/api/signals/${selectedSignalId}`)).json(),
     enabled: !!selectedSignalId && detailOpen,
   })
+
+  // Re-evaluate state
+  const [reevalStatus, setReevalStatus] = React.useState<{ loading: boolean; result?: any; error?: string }>({})
+
+  const handleReevaluate = async () => {
+    if (!selectedSignalId) return
+    setReevalStatus({ loading: true })
+    try {
+      const result = await collectorFetch<any>('/api/evaluate-signal', {
+        method: 'POST', json: { signalId: selectedSignalId },
+      })
+      setReevalStatus({ loading: false, result })
+      // Invalidate to refresh the signal detail
+      qc.invalidateQueries({ queryKey: ['signal', selectedSignalId] })
+      qc.invalidateQueries({ queryKey: ['signals'] })
+      qc.invalidateQueries({ queryKey: ['overview'] })
+    } catch (e) {
+      setReevalStatus({ loading: false, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
 
   return (
     <Sheet open={detailOpen} onOpenChange={(o) => !o && closeSignal()}>
@@ -215,6 +241,41 @@ export function SignalDetailDrawer() {
                 tag={data.evaluation.marketDataSource}
                 tone={data.evaluation.outcome === 'win' ? 'positive' : data.evaluation.outcome === 'loss' ? 'negative' : 'neutral'}
               >
+                {/* Re-evaluate button — always visible, especially useful for no_data */}
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleReevaluate}
+                    disabled={reevalStatus.loading}
+                    className="gap-1.5"
+                  >
+                    {reevalStatus.loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                    Re-evaluate
+                  </Button>
+                  {data.evaluation.outcome === 'no_data' && (
+                    <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                      Dukascopy returned no data — try re-evaluating
+                    </span>
+                  )}
+                </div>
+
+                {/* Re-evaluate result */}
+                {reevalStatus.result && (
+                  <div className="mb-3 flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs text-emerald-700 dark:text-emerald-400">
+                    <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div>
+                      <span className="font-medium">Re-evaluated:</span> {reevalStatus.result.outcome} (R={reevalStatus.result.rMultiple}, {reevalStatus.result.barsAnalyzed} bars)
+                    </div>
+                  </div>
+                )}
+                {reevalStatus.error && (
+                  <div className="mb-3 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-xs text-rose-600 dark:text-rose-400">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span className="break-words">{reevalStatus.error}</span>
+                  </div>
+                )}
+
                 <div className="mb-3 flex items-center justify-between rounded-lg border border-border/60 p-3">
                   <div className="flex items-center gap-3">
                     {data.evaluation.outcome === 'win' ? (
