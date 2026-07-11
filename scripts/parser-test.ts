@@ -31,6 +31,7 @@ const cases: TestCase[] = [
   { name: 'Long with SL above entry → null', text: '#XAUUSD 🟢 LONG\nEntry: 4145\nSL: 4200\nTP: 4180', expectNull: true },
   { name: 'Short with SL below entry → null', text: '#XAUUSD 🔴 SHORT\nEntry: 4145\nSL: 4100\nTP: 4180', expectNull: true },
   { name: 'Stock: $AAPL long', text: '$AAPL 🟢 LONG\nEntry: 189.50\nSL: 185.00\nTP: 195.00', expect: { instrument: 'AAPL', instrumentType: 'stocks', entryPrice: 189.5, stopLoss: 185, takeProfits: [195] } },
+  { name: 'Stock: #NVDA short (hashtag prefix)', text: '#NVDA 🔴 SHORT\nEntry: 125.34\nSL: 127.72\nTP: 122.96', expect: { instrument: 'NVDA', instrumentType: 'stocks', action: 'short', entryPrice: 125.34, stopLoss: 127.72, takeProfits: [122.96] } },
 ]
 
 let pass = 0, fail = 0
