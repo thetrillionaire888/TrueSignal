@@ -44,44 +44,6 @@ function NavContent() {
   )
 }
 
-function StatusCard() {
-  const { data } = useQuery({
-    queryKey: ['pipeline-summary'],
-    queryFn: async () => {
-      const r = await fetch('/api/pipeline')
-      return (await r.json()) as {
-        summary: { channels: number; totalSignals: number; parseRate: number }
-      }
-    },
-    staleTime: 60_000,
-  })
-  return (
-    <div className="mx-3 rounded-lg border border-sidebar-border/60 bg-sidebar-accent/40 p-3">
-      <div className="flex items-center gap-2">
-        <span className="relative flex h-2 w-2">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
-          <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-        </span>
-        <span className="text-xs font-medium text-sidebar-accent-foreground">Collector live</span>
-      </div>
-      <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-sidebar-foreground/60">
-        <div>
-          <div className="tnum text-sm font-semibold text-sidebar-accent-foreground">
-            {data?.summary.channels ?? '—'}
-          </div>
-          <div>channels</div>
-        </div>
-        <div>
-          <div className="tnum text-sm font-semibold text-sidebar-accent-foreground">
-            {data ? data.summary.totalSignals.toLocaleString() : '—'}
-          </div>
-          <div>signals</div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function AuthStatusCard() {
   const qc = useQueryClient()
   const { setView } = useUI()
@@ -171,7 +133,6 @@ export function AppSidebar() {
         <NavContent />
       </div>
       <div className="space-y-3 py-3">
-        <StatusCard />
         <AuthStatusCard />
         <div className="flex items-center gap-1.5 px-5 text-[10px] text-sidebar-foreground/30">
           <Activity className="h-3 w-3" />
