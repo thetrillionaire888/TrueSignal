@@ -23,7 +23,7 @@
  *   bun scripts/import-xauusd-csv.ts /path/to/file.csv
  *   bun scripts/import-xauusd-csv.ts  # defaults to upload dir
  */
-import { sqlite } from "@/lib/db";
+import { getMarketDbSync } from "@/lib/market-db";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -35,8 +35,11 @@ const SOURCE = "dukascopy";
 // 15 minutes in milliseconds
 const M15_MS = 15 * 60 * 1000;
 
-const insertStmt = sqlite.prepare(
-  `INSERT OR IGNORE INTO market.PriceBar
+// Get the per-asset DB connection for this instrument+timeframe
+const marketDb = getMarketDbSync(INSTRUMENT, TIMEFRAME);
+
+const insertStmt = marketDb.prepare(
+  `INSERT OR IGNORE INTO PriceBar
      (source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt)
    VALUES ($source, $instrument, $timeframe, $timestamp, $open, $high, $low, $close, $volume, datetime('now'))`
 );
@@ -185,9 +188,9 @@ async function main() {
   console.log();
 
   // Check what's currently in the DB
-  const existingCount = (sqlite.prepare(
-    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = ? AND timeframe = ?"
-  ).get(INSTRUMENT, TIMEFRAME) as { c: number }).c;
+  const existingCount = (marketDb.prepare(
+    "SELECT COUNT(*) as c FROM PriceBar"
+  ).get() as { c: number }).c;
   console.log(`Existing ${INSTRUMENT} ${TIMEFRAME} bars in DB: ${existingCount}`);
 
   // Insert in batches (transaction for speed)
@@ -202,7 +205,7 @@ async function main() {
   for (let i = 0; i < m15Bars.length; i += BATCH_SIZE) {
     const batch = m15Bars.slice(i, i + BATCH_SIZE);
 
-    const tx = sqlite.transaction(() => {
+    const tx = marketDb.transaction(() => {
       for (const bar of batch) {
         const result = insertStmt.run({
           $source: SOURCE,
@@ -237,14 +240,14 @@ async function main() {
   console.log(`  Total processed: ${totalProcessed}`);
 
   // Verify
-  const newCount = (sqlite.prepare(
-    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = ? AND timeframe = ?"
-  ).get(INSTRUMENT, TIMEFRAME) as { c: number }).c;
+  const newCount = (marketDb.prepare(
+    "SELECT COUNT(*) as c FROM PriceBar"
+  ).get() as { c: number }).c;
   console.log(`  DB now has: ${newCount} ${INSTRUMENT} ${TIMEFRAME} bars (was ${existingCount})`);
 
-  const range = sqlite.prepare(
-    "SELECT MIN(timestamp) as earliest, MAX(timestamp) as latest FROM market.PriceBar WHERE instrument = ? AND timeframe = ?"
-  ).get(INSTRUMENT, TIMEFRAME) as { earliest: number; latest: number };
+  const range = marketDb.prepare(
+    "SELECT MIN(timestamp) as earliest, MAX(timestamp) as latest FROM PriceBar"
+  ).get() as { earliest: number; latest: number };
   console.log(`  Date range: ${new Date(range.earliest).toISOString()} → ${new Date(range.latest).toISOString()}`);
   console.log();
 }

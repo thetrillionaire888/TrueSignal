@@ -6,6 +6,7 @@ import { Server as IOServer } from "socket.io";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { sqlite } from "@/lib/db";
+import { getMarketDbSync, listMarketDbs } from "@/lib/market-db";
 import * as tg from "./telegram";
 import { parseSignal } from "./parser";
 import { evaluateSignals, getEvalStats, type EvalProgress } from "./evaluator";
@@ -379,6 +380,9 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     // ── Browse price bars (paginated, filtered) ─────────────────────────────
     // Query params: instrument, source, timeframe, from (ISO date), to (ISO date),
     //               page (1-based), pageSize (max 500)
+    //
+    // With per-asset DBs, when instrument+timeframe are specified we query that
+    // specific DB. When they're not specified, we aggregate across all DBs.
     if (path === "/api/browse-bars" && req.method === "GET") {
       const instrument = url.searchParams.get("instrument") || undefined;
       const source = url.searchParams.get("source") || undefined;
@@ -388,44 +392,85 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
       const pageSize = Math.min(500, Math.max(10, parseInt(url.searchParams.get("pageSize") || "50", 10)));
 
+      const fromMs = fromIso ? new Date(fromIso).getTime() : undefined;
+      const toMs = toIso ? new Date(toIso).getTime() : undefined;
+
+      // Build the WHERE clause for use within a single per-asset DB.
+      // (instrument and timeframe are implicit — they're the DB's identity.)
       const conditions: string[] = [];
       const params: unknown[] = [];
-      if (instrument) { conditions.push("instrument = ?"); params.push(instrument.toLowerCase()); }
       if (source) { conditions.push("source = ?"); params.push(source.toLowerCase()); }
-      if (timeframe) { conditions.push("timeframe = ?"); params.push(timeframe.toLowerCase()); }
-      if (fromIso) { conditions.push("timestamp >= ?"); params.push(new Date(fromIso).getTime()); }
-      if (toIso) { conditions.push("timestamp < ?"); params.push(new Date(toIso).getTime()); }
-
+      if (fromMs) { conditions.push("timestamp >= ?"); params.push(fromMs); }
+      if (toMs) { conditions.push("timestamp < ?"); params.push(toMs); }
       const whereClause = conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : "";
       const offset = (page - 1) * pageSize;
 
-      const countRow = sqlite.prepare(`SELECT COUNT(*) as c FROM market.PriceBar ${whereClause}`).get(...params) as { c: number };
-      const rows = sqlite.prepare(
-        `SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt
-         FROM market.PriceBar ${whereClause}
-         ORDER BY timestamp DESC
-         LIMIT ? OFFSET ?`
-      ).all(...params, pageSize, offset) as Array<{
+      // Determine which DBs to query
+      const allDbs = listMarketDbs();
+      const targetDbs = allDbs.filter(d =>
+        (!instrument || d.instrument === instrument.toLowerCase()) &&
+        (!timeframe || d.timeframe === timeframe.toLowerCase())
+      );
+
+      // Aggregate count + rows across target DBs
+      let totalCount = 0;
+      const allRows: Array<{
         source: string; instrument: string; timeframe: string;
         timestamp: number; open: number; high: number; low: number;
         close: number; volume: number; fetchedAt: string;
-      }>;
+      }> = [];
 
-      // Get available instruments + sources + timeframes for filter dropdowns
-      const instruments = sqlite.prepare("SELECT DISTINCT instrument FROM market.PriceBar ORDER BY instrument").all() as Array<{ instrument: string }>;
-      const sources = sqlite.prepare("SELECT DISTINCT source FROM market.PriceBar ORDER BY source").all() as Array<{ source: string }>;
-      const timeframes = sqlite.prepare("SELECT DISTINCT timeframe FROM market.PriceBar ORDER BY timeframe").all() as Array<{ timeframe: string }>;
+      const allInstruments = new Set<string>();
+      const allSources = new Set<string>();
+      const allTimeframes = new Set<string>();
+
+      for (const { instrument: inst, timeframe: tf } of targetDbs) {
+        try {
+          const db = getMarketDbSync(inst, tf);
+
+          // Collect distinct values for filter dropdowns
+          const instRows = db.prepare("SELECT DISTINCT instrument FROM PriceBar").all() as Array<{ instrument: string }>;
+          instRows.forEach(r => allInstruments.add(r.instrument));
+          const srcRows = db.prepare("SELECT DISTINCT source FROM PriceBar").all() as Array<{ source: string }>;
+          srcRows.forEach(r => allSources.add(r.source));
+          const tfRows = db.prepare("SELECT DISTINCT timeframe FROM PriceBar").all() as Array<{ timeframe: string }>;
+          tfRows.forEach(r => allTimeframes.add(r.timeframe));
+
+          // Count
+          const countRow = db.prepare(`SELECT COUNT(*) as c FROM PriceBar ${whereClause}`).get(...params) as { c: number };
+          totalCount += countRow.c;
+
+          // Rows (we fetch from each DB, then sort+paginate across all)
+          const rows = db.prepare(
+            `SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt
+             FROM PriceBar ${whereClause}
+             ORDER BY timestamp DESC
+             LIMIT ? OFFSET ?`
+          ).all(...params, pageSize, offset) as Array<{
+            source: string; instrument: string; timeframe: string;
+            timestamp: number; open: number; high: number; low: number;
+            close: number; volume: number; fetchedAt: string;
+          }>;
+          allRows.push(...rows);
+        } catch (e) {
+          console.warn(`[browse-bars] failed to read ${inst}_${tf}: ${e}`);
+        }
+      }
+
+      // Sort all rows by timestamp DESC (merge across DBs) and paginate
+      allRows.sort((a, b) => b.timestamp - a.timestamp);
+      const paginatedRows = allRows.slice(0, pageSize);
 
       return json(res, 200, {
-        bars: rows,
-        total: countRow.c,
+        bars: paginatedRows,
+        total: totalCount,
         page,
         pageSize,
-        totalPages: Math.ceil(countRow.c / pageSize),
+        totalPages: Math.ceil(totalCount / pageSize),
         filters: {
-          instruments: instruments.map(i => i.instrument),
-          sources: sources.map(s => s.source),
-          timeframes: timeframes.map(t => t.timeframe),
+          instruments: Array.from(allInstruments).sort(),
+          sources: Array.from(allSources).sort(),
+          timeframes: Array.from(allTimeframes).sort(),
         },
       });
     }
@@ -436,20 +481,40 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       const instrument = url.searchParams.get("instrument") || undefined;
       const source = url.searchParams.get("source") || undefined;
 
-      // Use the shared `sqlite` connection (audit.db with market.db ATTACH'd).
-      // market.PriceBar is the attached table alias.
-      let query = "SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume FROM market.PriceBar";
-      const conditions: string[] = [];
-      const params: Record<string, unknown> = {};
-      if (instrument) { conditions.push("instrument = $instrument"); params.$instrument = instrument; }
-      if (source) { conditions.push("source = $source"); params.$source = source; }
-      if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
-      query += " ORDER BY timestamp ASC LIMIT 10000";
+      // Determine which DBs to query
+      const allDbs = listMarketDbs();
+      const targetDbs = allDbs.filter(d =>
+        (!instrument || d.instrument === instrument.toLowerCase())
+      );
 
-      const rows = sqlite.prepare(query).all(params) as Array<{
+      const allRows: Array<{
         source: string; instrument: string; timeframe: string;
         timestamp: number; open: number; high: number; low: number; close: number; volume: number;
-      }>;
+      }> = [];
+
+      for (const { instrument: inst, timeframe: tf } of targetDbs) {
+        try {
+          const db = getMarketDbSync(inst, tf);
+          let query = "SELECT source, instrument, timeframe, timestamp, open, high, low, close, volume FROM PriceBar";
+          const conditions: string[] = [];
+          const params: Record<string, unknown> = {};
+          if (source) { conditions.push("source = $source"); params.$source = source; }
+          if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
+          query += " ORDER BY timestamp ASC LIMIT 10000";
+
+          const rows = db.prepare(query).all(params) as Array<{
+            source: string; instrument: string; timeframe: string;
+            timestamp: number; open: number; high: number; low: number; close: number; volume: number;
+          }>;
+          allRows.push(...rows);
+        } catch (e) {
+          console.warn(`[export-bars] failed to read ${inst}_${tf}: ${e}`);
+        }
+      }
+
+      // Sort all rows by timestamp ASC
+      allRows.sort((a, b) => a.timestamp - b.timestamp);
+      const rows = allRows.slice(0, 10000);
 
       if (format === "json") {
         const body = JSON.stringify({ count: rows.length, bars: rows }, null, 2);

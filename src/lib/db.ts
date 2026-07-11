@@ -1,15 +1,18 @@
 // Unified database connection layer — used by BOTH the Next.js frontend AND
 // the telegram-collector mini-service.
 //
-// Architecture: 3 SQLite databases, each tuned for its access pattern.
+// Architecture: 2 SQLite databases (audit + catalog) on this connection,
+// plus per-asset market DBs managed by @/lib/market-db.
 //   - audit.db   : Messages + Signals + Evaluations (high-write + high-read)
 //   - catalog.db : Channels + ChannelStats + IngestState (read-heavy, rare writes)
-//   - market.db  : PriceBars (write-once, read-many, can be huge)
+//   - market/    : Per-asset PriceBar DBs (db/market/{instrument}_{timeframe}.db)
+//                  Managed separately by @/lib/market-db — NOT ATTACH'd here
+//                  (avoids SQLite's 10-attached-DB limit when many instruments)
 //
-// All 3 are ATTACH'd to a single SQLite connection, so cross-DB queries
-// like `SELECT * FROM catalog.Channel` work natively. Each DB has its own WAL
-// file → 3 independent writer locks → ingestion can write Messages while the
-// evaluator writes Evaluations with zero contention.
+// audit.db + catalog.db are ATTACH'd to a single SQLite connection so cross-DB
+// queries like `SELECT * FROM catalog.Channel` work natively. Each DB has its
+// own WAL file → independent writer locks → ingestion can write Messages while
+// the evaluator writes Evaluations with zero contention.
 //
 // Runtime-aware driver selection:
 //   - Bun (collector process)     → bun:sqlite (native, faster)
@@ -79,9 +82,8 @@ sqlite.exec('PRAGMA mmap_size = 268435456;')
 sqlite.exec('PRAGMA temp_store = MEMORY;')
 sqlite.exec('PRAGMA busy_timeout = 10000;')
 
-// ATTACH the other two DBs
+// ATTACH catalog.db (market data is now in per-asset DBs — see @/lib/market-db)
 sqlite.exec(`ATTACH '${CATALOG_DB_PATH}' AS catalog;`)
-sqlite.exec(`ATTACH '${MARKET_DB_PATH}' AS market;`)
 
 export { sqlite, db }
 

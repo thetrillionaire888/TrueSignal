@@ -9,13 +9,18 @@
 // tried first. For non-crypto instruments, Yahoo Finance serves as a
 // fallback when Dukascopy fails.
 //
+// Architecture: per-asset databases
+//   - Each instrument+timeframe gets its own SQLite file:
+//     db/market/{instrument}_{timeframe}.db
+//   - All sources for one instrument+timeframe live in one file
+//   - The `source` column distinguishes provenance
+//   - Connections are cached by getMarketDbSync() from @/lib/market-db
+//
 // Notes:
-//   - All PriceBar queries use the `market.PriceBar` prefix because the
-//     bars live in the attached market.db.
 //   - Batch-inserts bars in a single transaction to amortize COMMIT cost.
 //   - `$`-prefixed named params work in both bun:sqlite and better-sqlite3.
 import { getHistoricalRates } from "dukascopy-node";
-import { sqlite } from "@/lib/db";
+import { getMarketDbSync, listMarketDbs } from "@/lib/market-db";
 
 // 15-minute bar = 900000 ms
 const BAR_INTERVALS: Record<string, number> = {
@@ -28,24 +33,41 @@ const BAR_INTERVALS: Record<string, number> = {
   d1: 86_400_000,
 };
 
-const stmts = {
-  getCachedRange: sqlite.prepare(
-    "SELECT timestamp, open, high, low, close, volume FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to ORDER BY timestamp ASC"
-  ),
-  countCachedRange: sqlite.prepare(
-    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe AND timestamp >= $from AND timestamp < $to"
-  ),
-  insertBar: sqlite.prepare(
-    "INSERT OR IGNORE INTO market.PriceBar (source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt) VALUES ($source, $instrument, $timeframe, $timestamp, $open, $high, $low, $close, $volume, datetime('now'))"
-  ),
-  totalCached: sqlite.prepare(
-    "SELECT COUNT(*) as c FROM market.PriceBar WHERE instrument = $instrument AND timeframe = $timeframe"
-  ),
-  cacheSummary: sqlite.prepare(
-    "SELECT source, instrument, COUNT(*) as c, MIN(timestamp) as earliest, MAX(timestamp) as latest FROM market.PriceBar GROUP BY source, instrument ORDER BY source, instrument"
-  ),
-  totalBars: sqlite.prepare("SELECT COUNT(*) as c FROM market.PriceBar"),
+// ── Per-connection prepared statement cache ──────────────────────────────────
+// Each per-asset DB gets its own set of prepared statements, cached by
+// (instrument, timeframe) key. This replaces the old global `stmts` object
+// that referenced the single attached market.db.
+
+type PreparedStmts = {
+  getCachedRange: any;
+  countCachedRange: any;
+  insertBar: any;
+  totalCached: any;
 };
+
+const stmtCache = new Map<string, PreparedStmts>();
+
+function getStmts(instrument: string, timeframe: string): PreparedStmts {
+  const key = `${instrument}|${timeframe}`;
+  if (!stmtCache.has(key)) {
+    const db = getMarketDbSync(instrument, timeframe);
+    stmtCache.set(key, {
+      getCachedRange: db.prepare(
+        "SELECT timestamp, open, high, low, close, volume FROM PriceBar WHERE timestamp >= $from AND timestamp < $to ORDER BY timestamp ASC"
+      ),
+      countCachedRange: db.prepare(
+        "SELECT COUNT(*) as c FROM PriceBar WHERE timestamp >= $from AND timestamp < $to"
+      ),
+      insertBar: db.prepare(
+        "INSERT OR IGNORE INTO PriceBar (source, instrument, timeframe, timestamp, open, high, low, close, volume, fetchedAt) VALUES ($source, $instrument, $timeframe, $timestamp, $open, $high, $low, $close, $volume, datetime('now'))"
+      ),
+      totalCached: db.prepare(
+        "SELECT COUNT(*) as c FROM PriceBar"
+      ),
+    });
+  }
+  return stmtCache.get(key)!;
+}
 
 export type Bar = {
   timestamp: number;
@@ -158,7 +180,10 @@ function batchInsertBars(
   let skipped = 0;
   if (bars.length === 0) return { inserted, skipped };
 
-  const tx = sqlite.transaction(() => {
+  const stmts = getStmts(instrument, timeframe);
+  const db = getMarketDbSync(instrument, timeframe);
+
+  const tx = db.transaction(() => {
     for (const bar of bars) {
       const result = stmts.insertBar.run({
         $source: source,
@@ -506,10 +531,10 @@ export async function fetchBarsCached(
   const toMs = toTime.getTime();
   void BAR_INTERVALS[timeframe]; // reserved for future gap-detection
 
+  const stmts = getStmts(instrument, timeframe);
+
   // Check what we already have cached for this exact time range
   const cachedCount = (stmts.countCachedRange.get({
-    $instrument: instrument,
-    $timeframe: timeframe,
     $from: fromMs,
     $to: toMs,
   }) as { c: number }).c;
@@ -518,8 +543,6 @@ export async function fetchBarsCached(
   // Skip this optimization when forceRefresh=true.
   if (!forceRefresh && cachedCount > 0) {
     const cachedBars = (stmts.getCachedRange.all({
-      $instrument: instrument,
-      $timeframe: timeframe,
       $from: fromMs,
       $to: toMs,
     }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
@@ -557,8 +580,6 @@ export async function fetchBarsCached(
 
         // Re-read from cache to get the merged view (cached + newly fetched)
         const mergedBars = (stmts.getCachedRange.all({
-          $instrument: instrument,
-          $timeframe: timeframe,
           $from: fromMs,
           $to: toMs,
         }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
@@ -593,8 +614,6 @@ export async function fetchBarsCached(
   // ── All sources failed — fall back to whatever we have cached ───────────
   onProgress?.(`all sources failed — falling back to cache (${cachedCount} bars)`);
   const cachedBars = (stmts.getCachedRange.all({
-    $instrument: instrument,
-    $timeframe: timeframe,
     $from: fromMs,
     $to: toMs,
   }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
@@ -615,7 +634,8 @@ export async function fetchBarsCached(
 }
 
 export function getCacheStats(instrument: string, timeframe: string): number {
-  return (stmts.totalCached.get({ $instrument: instrument, $timeframe: timeframe }) as { c: number }).c;
+  const stmts = getStmts(instrument, timeframe);
+  return (stmts.totalCached.get() as { c: number }).c;
 }
 
 // ── Generic bar import (for non-Dukascopy sources) ──────────────────────────
@@ -630,23 +650,54 @@ export function importBars(
 }
 
 // ── Cache summary for the Data Manager UI ───────────────────────────────────
+// Iterates over all per-asset DB files and aggregates stats across all of them.
 export function getCacheSummary() {
-  const total = (stmts.totalBars.get() as { c: number }).c;
-  const bySource = stmts.cacheSummary.all() as Array<{
+  const marketDbs = listMarketDbs();
+  let totalBars = 0;
+  const groups: Array<{
     source: string;
     instrument: string;
-    c: number;
+    count: number;
     earliest: number;
     latest: number;
-  }>;
-  return {
-    totalBars: total,
-    groups: bySource.map((g) => ({
-      source: g.source,
-      instrument: g.instrument,
-      count: g.c,
-      earliest: g.earliest,
-      latest: g.latest,
-    })),
-  };
+  }> = [];
+
+  for (const { instrument, timeframe } of marketDbs) {
+    try {
+      const db = getMarketDbSync(instrument, timeframe);
+      const totalRow = db.prepare("SELECT COUNT(*) as c FROM PriceBar").get() as { c: number };
+      totalBars += totalRow.c;
+
+      const sourceRows = db.prepare(
+        "SELECT source, COUNT(*) as c, MIN(timestamp) as earliest, MAX(timestamp) as latest FROM PriceBar GROUP BY source ORDER BY source"
+      ).all() as Array<{
+        source: string;
+        c: number;
+        earliest: number;
+        latest: number;
+      }>;
+
+      for (const r of sourceRows) {
+        groups.push({
+          source: r.source,
+          instrument,
+          count: r.c,
+          earliest: r.earliest,
+          latest: r.latest,
+        });
+      }
+    } catch (e) {
+      // skip DBs that can't be opened
+      console.warn(`[bar-cache] getCacheSummary: failed to read ${instrument}_${timeframe}: ${e}`);
+    }
+  }
+
+  // Sort groups by instrument then source for consistent display
+  groups.sort((a, b) =>
+    a.instrument === b.instrument
+      ? a.source.localeCompare(b.source)
+      : a.instrument.localeCompare(b.instrument)
+  );
+
+  return { totalBars, groups };
 }
