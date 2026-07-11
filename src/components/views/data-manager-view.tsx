@@ -421,7 +421,6 @@ function ImportTab() {
   const [timeframe, setTimeframe] = React.useState('m1')
   const [csvFile, setCsvFile] = React.useState<File | null>(null)
   const [csvText, setCsvText] = React.useState('')
-  const [inputMode, setInputMode] = React.useState<'file' | 'paste'>('file')
   const [result, setResult] = React.useState<{
     instrument: string
     source: string
@@ -438,14 +437,18 @@ function ImportTab() {
   } | null>(null)
   const [error, setError] = React.useState<string | null>(null)
 
+  // Which input source to use: 'file' takes priority if a file is selected,
+  // otherwise 'paste' is used. No toggle button needed — both inputs are
+  // always visible, and the import button uses whichever has data.
+  const activeSource = csvFile ? 'file' : 'paste'
+
   const importMut = useMutation({
     mutationFn: async () => {
       let csvContent: string
-      if (inputMode === 'file') {
-        if (!csvFile) throw new Error('Please select a CSV file')
+      if (csvFile) {
         csvContent = await csvFile.text()
       } else {
-        if (!csvText.trim()) throw new Error('Please paste CSV content')
+        if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
         csvContent = csvText
       }
       return collectorFetch<{
@@ -488,6 +491,8 @@ function ImportTab() {
     setResult(null)
     setError(null)
   }
+
+  const canImport = !importMut.isPending && (csvFile || csvText.trim().length > 0)
 
   return (
     <div className="space-y-5">
@@ -548,60 +553,44 @@ function ImportTab() {
             </div>
           </div>
 
-          {/* Input mode toggle */}
-          <div className="flex items-center gap-2">
-            <Button
-              variant={inputMode === 'file' ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => { setInputMode('file'); setResult(null); setError(null) }}
-              className="gap-1.5"
-            >
-              <Upload className="h-3.5 w-3.5" />
-              Upload File
-            </Button>
-            <Button
-              variant={inputMode === 'paste' ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => { setInputMode('paste'); setResult(null); setError(null) }}
-              className="gap-1.5"
-            >
-              <FileText className="h-3.5 w-3.5" />
-              Paste CSV
-            </Button>
+          {/* File upload */}
+          <div>
+            <Label className="mb-2 block text-xs">CSV File</Label>
+            <input
+              type="file"
+              accept=".csv,.txt,.tsv"
+              onChange={handleFileChange}
+              className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-medium file:text-primary-foreground hover:file:bg-primary/90"
+            />
+            {csvFile && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Selected: <span className="font-medium text-foreground">{csvFile.name}</span> ({(csvFile.size / 1024 / 1024).toFixed(2)} MB)
+              </p>
+            )}
           </div>
 
-          {/* File upload or paste textarea */}
-          {inputMode === 'file' ? (
-            <div>
-              <Label className="mb-2 block text-xs">CSV File</Label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="file"
-                  accept=".csv,.txt,.tsv"
-                  onChange={handleFileChange}
-                  className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-medium file:text-primary-foreground hover:file:bg-primary/90"
-                />
-              </div>
-              {csvFile && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Selected: <span className="font-medium text-foreground">{csvFile.name}</span> ({(csvFile.size / 1024 / 1024).toFixed(2)} MB)
-                </p>
-              )}
-            </div>
-          ) : (
-            <div>
-              <Label className="mb-2 block text-xs">CSV Content</Label>
-              <Textarea
-                value={csvText}
-                onChange={(e) => { setCsvText(e.target.value); setResult(null); setError(null) }}
-                placeholder={`Date,Time,Open,High,Low,Close,Volume\n20240506,01:00:00,2304.655,2305.855,2303.055,2303.255,93470\n...`}
-                className="min-h-[200px] font-mono text-xs"
-              />
-              <p className="mt-1 text-[10px] text-muted-foreground">
-                {csvText.length.toLocaleString()} chars · ~{csvText.split('\n').filter(l => l.trim()).length.toLocaleString()} lines
-              </p>
-            </div>
-          )}
+          {/* Divider */}
+          <div className="flex items-center gap-3 py-1">
+            <div className="h-px flex-1 bg-border/50" />
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">or paste CSV</span>
+            <div className="h-px flex-1 bg-border/50" />
+          </div>
+
+          {/* Paste textarea */}
+          <div>
+            <Textarea
+              value={csvText}
+              onChange={(e) => { setCsvText(e.target.value); setResult(null); setError(null) }}
+              placeholder={`Date,Time,Open,High,Low,Close,Volume\n20240506,01:00:00,2304.655,2305.855,2303.055,2303.255,93470\n...`}
+              className="min-h-[150px] font-mono text-xs"
+              disabled={!!csvFile}
+            />
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              {csvFile
+                ? 'File selected — paste is disabled. Clear the file to use paste instead.'
+                : `${csvText.length.toLocaleString()} chars · ~${csvText.split('\n').filter(l => l.trim()).length.toLocaleString()} lines`}
+            </p>
+          </div>
 
           {/* Supported formats hint */}
           <div className="rounded-lg border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground">
@@ -617,11 +606,11 @@ function ImportTab() {
             </p>
           </div>
 
-          {/* Import button */}
+          {/* Single Import action button */}
           <div className="flex items-center gap-3">
             <Button
               onClick={() => importMut.mutate()}
-              disabled={importMut.isPending || (inputMode === 'file' ? !csvFile : !csvText.trim())}
+              disabled={!canImport}
               className="gap-1.5"
             >
               {importMut.isPending ? (
@@ -632,7 +621,7 @@ function ImportTab() {
               ) : (
                 <>
                   <Upload className="h-4 w-4" />
-                  Import CSV
+                  Import CSV{activeSource === 'file' && csvFile ? ` — ${csvFile.name.slice(0, 30)}${csvFile.name.length > 30 ? '…' : ''}` : ''}
                 </>
               )}
             </Button>
