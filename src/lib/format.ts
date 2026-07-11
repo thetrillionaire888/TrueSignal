@@ -46,14 +46,25 @@ export function fmtDuration(minutes: number | null | undefined): string {
   return rh ? `${d}d ${rh}h` : `${d}d`
 }
 
-export function fmtDate(iso: string | Date, opts?: Intl.DateTimeFormatOptions): string {
-  const d = typeof iso === 'string' ? new Date(iso) : iso
+type DateInput = string | Date | number | null | undefined
+
+function toDate(iso: DateInput): Date | null {
+  if (iso == null) return null
+  if (typeof iso === 'number') return new Date(iso)
+  return typeof iso === 'string' ? new Date(iso) : iso
+}
+
+export function fmtDate(iso: DateInput, opts?: Intl.DateTimeFormatOptions): string {
+  const d = toDate(iso)
+  if (!d) return '—'
   return d.toLocaleDateString('en-US', opts ?? { month: 'short', day: 'numeric' })
 }
 
-export function fmtDateTime(iso: string | Date): string {
-  const d = typeof iso === 'string' ? new Date(iso) : iso
+export function fmtDateTime(iso: DateInput): string {
+  const d = toDate(iso)
+  if (!d) return '—'
   return d.toLocaleString('en-US', {
+    year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -61,8 +72,9 @@ export function fmtDateTime(iso: string | Date): string {
   })
 }
 
-export function timeAgo(iso: string | Date): string {
-  const d = typeof iso === 'string' ? new Date(iso) : iso
+export function timeAgo(iso: DateInput): string {
+  const d = toDate(iso)
+  if (!d) return '—'
   const diff = Date.now() - d.getTime()
   const min = Math.floor(diff / 60000)
   if (min < 1) return 'just now'
