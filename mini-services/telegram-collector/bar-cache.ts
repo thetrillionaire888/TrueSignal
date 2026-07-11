@@ -179,38 +179,50 @@ export async function fetchBarsCached(
                       .includes(binanceSymbol);
     if (isCrypto) {
       onProgress?.(`Dukascopy failed — trying Binance fallback for ${binanceSymbol}…`);
-      try {
-        const binanceInterval: Record<string, string> = {
-          m1: "1m", m5: "5m", m15: "15m", m30: "30m", h1: "1h", h4: "4h", d1: "1d",
-        };
-        const bi = binanceInterval[timeframe] ?? "15m";
-        const binanceUrl = new URL("https://api.binance.com/api/v3/klines");
-        binanceUrl.searchParams.set("symbol", binanceSymbol);
-        binanceUrl.searchParams.set("interval", bi);
-        binanceUrl.searchParams.set("startTime", String(fromMs));
-        binanceUrl.searchParams.set("endTime", String(toMs));
-        binanceUrl.searchParams.set("limit", "1000");
+      // Retry Binance up to 3 times (handles TLS errors, rate limiting, transient network issues)
+      for (let binanceAttempt = 0; binanceAttempt < 3; binanceAttempt++) {
+        try {
+          const binanceInterval: Record<string, string> = {
+            m1: "1m", m5: "5m", m15: "15m", m30: "30m", h1: "1h", h4: "4h", d1: "1d",
+          };
+          const bi = binanceInterval[timeframe] ?? "15m";
+          const binanceUrl = new URL("https://api.binance.com/api/v3/klines");
+          binanceUrl.searchParams.set("symbol", binanceSymbol);
+          binanceUrl.searchParams.set("interval", bi);
+          binanceUrl.searchParams.set("startTime", String(fromMs));
+          binanceUrl.searchParams.set("endTime", String(toMs));
+          binanceUrl.searchParams.set("limit", "1000");
 
-        // Wrap Binance fetch in a 10s timeout too (same TLS hang issue)
-        const binanceFetchPromise = fetch(binanceUrl.toString());
-        const binanceTimeoutPromise = new Promise<Response>((_, reject) =>
-          setTimeout(() => reject(new Error("Binance fetch timed out after 10s")), 10000)
-        );
-        const binanceRes = await Promise.race([binanceFetchPromise, binanceTimeoutPromise]);
-        if (binanceRes.ok) {
-          const binanceData = (await binanceRes.json()) as unknown[][];
-          fetched = binanceData.map((row) => [
-            Number(row[0]),  // timestamp
-            parseFloat(row[1] as string),  // open
-            parseFloat(row[2] as string),  // high
-            parseFloat(row[3] as string),  // low
-            parseFloat(row[4] as string),  // close
-            parseFloat(row[5] as string),  // volume
-          ]);
-          onProgress?.(`Binance fallback: ${fetched.length} bars for ${binanceSymbol}`);
+          // Wrap in 10s timeout (TLS hangs, rate limiting)
+          const binanceFetchPromise = fetch(binanceUrl.toString());
+          const binanceTimeoutPromise = new Promise<Response>((_, reject) =>
+            setTimeout(() => reject(new Error("Binance fetch timed out after 10s")), 10000)
+          );
+          const binanceRes = await Promise.race([binanceFetchPromise, binanceTimeoutPromise]);
+          if (binanceRes.ok) {
+            const binanceData = (await binanceRes.json()) as unknown[][];
+            fetched = binanceData.map((row) => [
+              Number(row[0]),
+              parseFloat(row[1] as string),
+              parseFloat(row[2] as string),
+              parseFloat(row[3] as string),
+              parseFloat(row[4] as string),
+              parseFloat(row[5] as string),
+            ]);
+            onProgress?.(`Binance fallback: ${fetched.length} bars for ${binanceSymbol}`);
+            break; // success — stop retrying
+          } else {
+            const body = await binanceRes.text();
+            console.warn(`[bar-cache] Binance API error ${binanceRes.status}: ${body.slice(0, 200)}`);
+          }
+        } catch (e2) {
+          const msg = e2 instanceof Error ? e2.message : String(e2);
+          console.warn(`[bar-cache] Binance attempt ${binanceAttempt + 1}/3 failed: ${msg}`);
+          if (binanceAttempt < 2) {
+            const delay = 1000 * Math.pow(2, binanceAttempt); // 1s, 2s
+            await new Promise((r) => setTimeout(r, delay));
+          }
         }
-      } catch (e2) {
-        console.warn(`[bar-cache] Binance fallback also failed:`, e2 instanceof Error ? e2.message : String(e2));
       }
     }
 
