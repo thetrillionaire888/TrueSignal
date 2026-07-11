@@ -121,6 +121,9 @@ export type ImportProgress = {
   skipped: number
   instrument: string
   timeframe: string
+  // Present on 'complete' phase:
+  sourceTimeframe?: string
+  dateRange?: { from: string | null; to: string | null }
 }
 
 // Singleton socket manager — connects lazily on first use.

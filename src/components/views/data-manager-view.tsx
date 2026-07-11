@@ -440,13 +440,31 @@ function ImportTab() {
   } | null>(null)
   const [error, setError] = React.useState<string | null>(null)
 
-  // Listen for import progress events from the streaming endpoint
+  // Listen for import progress events from the streaming endpoint.
+  // For large files, the HTTP response is 202 Accepted (job started) and
+  // the actual result comes via Socket.IO 'complete' event.
   useCollectorSocket(
     () => {}, // ingest progress — not used here
     () => {}, // eval progress — not used here
     (p) => {
       setProgress(p)
       if (p.phase === 'complete') {
+        // The import finished — build the result from the socket event
+        setResult({
+          instrument: p.instrument,
+          source: source,
+          timeframe: p.timeframe,
+          parsedBars: p.parsed,
+          storedBars: p.parsed, // streaming endpoint doesn't aggregate
+          inserted: p.inserted,
+          skipped: p.skipped,
+          aggregated: false,
+          sourceTimeframe: p.sourceTimeframe ?? 'm1',
+          dateRange: p.dateRange ?? { from: null, to: null },
+        })
+        setIsImporting(false)
+      } else if (p.phase === 'error') {
+        setError(p.message)
         setIsImporting(false)
       }
     }
@@ -463,6 +481,10 @@ function ImportTab() {
         // ── Streaming upload for files (handles 400MB+ without OOM) ────────
         // Uses multipart/form-data — the browser streams the file from disk
         // to the network without loading it all into memory.
+        //
+        // The server returns 202 Accepted immediately and processes the file
+        // in the background. Progress + final result come via Socket.IO
+        // (handled by the useCollectorSocket hook above).
         const formData = new FormData()
         formData.append('file', csvFile)
 
@@ -478,8 +500,6 @@ function ImportTab() {
           body: formData,
         })
         // Read the response as text first, then try to parse as JSON.
-        // This avoids confusing "invalid response" errors when the proxy
-        // returns an HTML error page or an unexpected content type.
         const responseText = await res.text()
         let data: unknown
         try {
@@ -491,20 +511,13 @@ function ImportTab() {
             `Response was not JSON (first 200 chars): ${responseText.slice(0, 200)}`
           )
         }
-        if (!res.ok) {
+        if (!res.ok && res.status !== 202) {
           const errMsg = (data as { error?: string }).error ?? `HTTP ${res.status} ${res.statusText}`
           throw new Error(errMsg)
         }
-        // Validate the response shape — the streaming endpoint must return
-        // at least parsedBars + inserted + skipped.
-        const parsed = data as { parsedBars?: number; inserted?: number; skipped?: number }
-        if (typeof parsed.parsedBars !== 'number' || typeof parsed.inserted !== 'number') {
-          throw new Error(
-            `Unexpected response from server. Expected {parsedBars, inserted, skipped} but got: ` +
-            JSON.stringify(data).slice(0, 300)
-          )
-        }
-        setResult(parsed as NonNullable<typeof result>)
+        // 202 Accepted = job started. The actual result will arrive via
+        // Socket.IO. Don't set isImporting=false here — keep the spinner
+        // running until the 'complete' event arrives.
       } else {
         // ── JSON endpoint for pasted CSV (small data, no streaming needed) ─
         if (!csvText.trim()) throw new Error('Please select a CSV file or paste CSV content')
@@ -532,13 +545,16 @@ function ImportTab() {
           },
         })
         setResult(data)
+        setIsImporting(false)
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setResult(null)
-    } finally {
       setIsImporting(false)
     }
+    // Note: for file uploads, don't set isImporting=false in finally —
+    // the Socket.IO 'complete' handler does that when the import finishes.
+    // For paste, we set it explicitly above.
   }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {

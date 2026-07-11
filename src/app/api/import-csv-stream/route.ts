@@ -14,8 +14,9 @@ import type { IncomingMessage } from "node:http";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-// Allow large uploads (no body size limit) + long duration (5 minutes)
-export const maxDuration = 300;
+// Allow large uploads (no body size limit) + long duration (30 minutes)
+// A 441MB CSV with ~7.6M rows can take 10-15 minutes to parse + insert
+export const maxDuration = 1800;
 
 const COLLECTOR_HOST = "localhost";
 const COLLECTOR_PORT = 3001;
@@ -45,6 +46,10 @@ export async function POST(req: NextRequest) {
         // Don't set Content-Length — we're streaming, let the proxy use
         // chunked transfer encoding
       },
+      // No timeout — large file imports (400MB+) can take 5-10 minutes
+      // to parse + insert into SQLite. The default timeout would kill
+      // the connection before the collector finishes.
+      timeout: 0,
     }, (proxyRes: IncomingMessage) => {
       // Read the full response from the collector and forward it
       const chunks: Buffer[] = [];
@@ -64,6 +69,13 @@ export async function POST(req: NextRequest) {
           { status: 502 }
         ));
       });
+    });
+
+    // Disable the socket timeout too (http.request's timeout option
+    // only covers the initial connection, not the full request)
+    proxyReq.on("socket", (socket) => {
+      socket.setTimeout(0);
+      socket.setKeepAlive(true);
     });
 
     proxyReq.on("error", (err) => {

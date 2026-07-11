@@ -1004,6 +1004,17 @@ async function handleStreamingCsvImport(
 
   console.log(`[import-csv-stream] Starting: instrument=${instrument}, source=${source}, timeframe=${timeframe}, boundary=${boundary.slice(0, 20)}…`);
 
+  // Send 202 Accepted immediately — the actual processing happens in the
+  // background. Progress + final result are sent via Socket.IO.
+  // This avoids HTTP timeouts for large files (400MB+ takes 5-15 minutes).
+  json(res, 202, {
+    jobId: `import-${Date.now()}`,
+    message: "Streaming import started. Progress will be reported via Socket.IO.",
+    instrument,
+    source,
+    timeframe,
+  });
+
   // Set up the streaming CSV parser + batch inserter
   const jobId = `import-${Date.now()}`;
   let totalInserted = 0;
@@ -1159,7 +1170,7 @@ async function handleStreamingCsvImport(
       flushBatch();
     }
 
-    // Final progress emit
+    // Final progress emit with complete results
     io.emit("import:progress", {
       jobId,
       phase: "complete" as const,
@@ -1169,26 +1180,30 @@ async function handleStreamingCsvImport(
       skipped: totalSkipped,
       instrument,
       timeframe,
-    });
-
-    console.log(`[import-csv-stream] Complete: ${totalInserted} inserted, ${totalSkipped} skipped, ${totalParsed} parsed, ${fileBytesReceived} file bytes`);
-
-    return json(res, 200, {
-      instrument,
-      source,
-      timeframe,
-      parsedBars: totalParsed,
-      inserted: totalInserted,
-      skipped: totalSkipped,
       sourceTimeframe,
       dateRange: {
         from: firstBarTs !== null ? new Date(firstBarTs).toISOString() : null,
         to: lastBarTs !== null ? new Date(lastBarTs).toISOString() : null,
       },
     });
+
+    console.log(`[import-csv-stream] Complete: ${totalInserted} inserted, ${totalSkipped} skipped, ${totalParsed} parsed, ${fileBytesReceived} file bytes`);
+
+    // Response already sent (202 Accepted) — nothing to return here.
+    // The frontend picks up the result from the Socket.IO 'complete' event.
   } catch (e) {
     console.error(`[import-csv-stream] Error:`, e);
-    return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+    // Emit error via Socket.IO (HTTP response already sent)
+    io.emit("import:progress", {
+      jobId,
+      phase: "error" as const,
+      message: e instanceof Error ? e.message : String(e),
+      parsed: totalParsed,
+      inserted: totalInserted,
+      skipped: totalSkipped,
+      instrument,
+      timeframe,
+    });
   }
 }
 
@@ -1197,6 +1212,15 @@ httpServer.listen(PORT, () => {
   console.log(`  API:  /api/status, /api/connect, /api/auth/*, /api/resolve-channel, /api/ingest`);
   console.log(`  WS:   socket.io path "/" (use ?XTransformPort=${PORT} from frontend)`);
 });
+
+// ── Timeout configuration for large uploads ─────────────────────────────────
+// Default Node.js HTTP timeouts (2 min) are too short for streaming CSV
+// imports of large files (400MB+ takes 5-10 minutes to parse + insert).
+// Disable the server-side timeouts so long-running requests can complete.
+httpServer.timeout = 0;           // no inactivity timeout
+httpServer.requestTimeout = 0;    // no overall request timeout
+httpServer.keepAliveTimeout = 0;  // keep connections alive indefinitely
+httpServer.headersTimeout = 0;    // no header timeout
 
 // Auto-connect on startup if session exists
 (async () => {
