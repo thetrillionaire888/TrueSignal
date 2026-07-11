@@ -174,6 +174,84 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       return json(res, 200, { jobId, message: "Evaluation started", channelId });
     }
 
+    // ── Re-parse messages for a channel (multi-stage parser + correlator) ──
+    if (path === "/api/reparse" && req.method === "POST") {
+      const channelId = (body.channelId as string) || null;
+      if (!channelId) return json(res, 400, { error: "channelId is required" });
+
+      try {
+        const { parseSignal } = await import("./parser");
+        const { correlateChannelSignals } = await import("./correlator");
+        const { cuid } = await import("./cuid");
+
+        // Get all messages for this channel
+        const messages = sqlite.prepare(
+          "SELECT id, channelId, rawText, postedAt FROM Message WHERE channelId = ? ORDER BY postedAt ASC"
+        ).all(channelId) as Array<{ id: string; channelId: string; rawText: string; postedAt: string }>;
+
+        // Clear old signals + evaluations for this channel
+        const clearTx = sqlite.transaction(() => {
+          sqlite.prepare("DELETE FROM Evaluation WHERE signalId IN (SELECT id FROM Signal WHERE channelId = ?)").run(channelId);
+          sqlite.prepare("DELETE FROM Signal WHERE channelId = ?").run(channelId);
+        });
+        clearTx();
+
+        // Re-parse each message with the multi-stage parser
+        let parsedCount = 0;
+        let correlatedCount = 0;
+        const insertSignal = sqlite.prepare(
+          `INSERT OR IGNORE INTO Signal (id, messageId, channelId, instrument, instrumentType, action, entryPrice, entryLow, entryHigh, isRange, stopLoss, takeProfits, positionSize, leverage, timeframe, confidence, parserVersion, parsedAt, status, notes, dedupHash) VALUES ($id, $messageId, $channelId, $instrument, $instrumentType, $action, $entryPrice, $entryLow, $entryHigh, $isRange, $stopLoss, $takeProfits, $positionSize, $leverage, $timeframe, $confidence, $parserVersion, $parsedAt, $status, $notes, $dedupHash)`
+        );
+
+        const parseTx = sqlite.transaction(() => {
+          for (const msg of messages) {
+            const result = parseSignal(msg.rawText || "");
+            if (result) {
+              const id = cuid();
+              const dedupHash = `${msg.channelId}|${msg.postedAt}`;
+              insertSignal.run({
+                $id: id, $messageId: msg.id, $channelId: msg.channelId,
+                $instrument: result.instrument, $instrumentType: result.instrumentType,
+                $action: result.action, $entryPrice: result.entryPrice,
+                $entryLow: result.entryLow, $entryHigh: result.entryHigh,
+                $isRange: result.isRange ? 1 : 0, $stopLoss: result.stopLoss,
+                $takeProfits: JSON.stringify(result.takeProfits),
+                $positionSize: result.positionSize, $leverage: result.leverage,
+                $timeframe: result.timeframe, $confidence: result.confidence,
+                $parserVersion: "multi-stage-v3", $parsedAt: new Date().toISOString(),
+                $status: "evaluating", $notes: result.notes, $dedupHash: dedupHash,
+              });
+              sqlite.prepare("UPDATE Message SET parseStatus = 'parsed' WHERE id = ?").run(msg.id);
+              parsedCount++;
+            } else {
+              const hasText = (msg.rawText || "").trim().length > 0;
+              sqlite.prepare("UPDATE Message SET parseStatus = ? WHERE id = ?").run(hasText ? "no_signal" : "no_text", msg.id);
+            }
+          }
+        });
+        parseTx();
+
+        // Run correlator for multi-message signals (order ID / magic number)
+        const corrResult = correlateChannelSignals(channelId);
+        correlatedCount = corrResult.signalsCreated;
+
+        // Update channel stats
+        sqlite.prepare(
+          "UPDATE catalog.ChannelStats SET signalCount = (SELECT COUNT(*) FROM Signal WHERE channelId = ?), messageCount = (SELECT COUNT(*) FROM Message WHERE channelId = ?), updatedAt = datetime('now') WHERE channelId = ?"
+        ).all(channelId, channelId, channelId);
+
+        return json(res, 200, {
+          channelId,
+          messagesProcessed: messages.length,
+          signalsParsed: parsedCount,
+          signalsCorrelated: correlatedCount,
+          totalSignals: parsedCount + correlatedCount,
+        });
+      } catch (e) {
+        return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     if (path === "/api/eval-stats" && req.method === "GET") {
       const channelId = url.searchParams.get("channelId") ?? undefined;
       const stats = getEvalStats(channelId);
