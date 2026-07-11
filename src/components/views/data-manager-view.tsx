@@ -489,12 +489,15 @@ function ImportTab() {
         formData.append('file', csvFile)
 
         const params = new URLSearchParams({
+          XTransformPort: '3001',
           instrument,
           source,
           timeframe,
         })
-        // Call the Next.js route handler which streams the request to the
-        // collector (avoids the rewrite proxy buffering the entire body).
+        // Call the collector directly via Caddy's XTransformPort proxy.
+        // This bypasses Next.js (port 3000) and goes straight to the
+        // collector (port 3001) — one fewer proxy layer for large uploads.
+        // Caddy streams the request body without buffering.
         const res = await fetch(`/api/import-csv-stream?${params}`, {
           method: 'POST',
           body: formData,

@@ -1,23 +1,52 @@
 :81 {
-	@transform_port_query {
-		query XTransformPort=*
-	}
+        # Allow large file uploads (400MB+ CSV imports)
+        # No request body size limit, long timeouts for streaming imports
+        request_body {
+                max_size 0
+        }
 
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        # Timeouts — generous for large file imports (can take 10-15 minutes)
+        timeouts {
+                read   30m
+                write  30m
+                header 30m
+        }
 
-	handle {
-		reverse_proxy localhost:3000 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        @transform_port_query {
+                query XTransformPort=*
+        }
+
+        handle @transform_port_query {
+                reverse_proxy localhost:{query.XTransformPort} {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                        # Flush immediately — don't buffer responses (important for streaming)
+                        flush_interval -1
+                        # Long timeouts for the upstream connection too
+                        transport http {
+                                read_timeout 30m
+                                write_timeout 30m
+                                dial_timeout 30s
+                        }
+                }
+        }
+
+        handle {
+                reverse_proxy localhost:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                        # Flush immediately — don't buffer responses
+                        flush_interval -1
+                        # Long timeouts for large uploads proxied to Next.js
+                        transport http {
+                                read_timeout 30m
+                                write_timeout 30m
+                                dial_timeout 30s
+                        }
+                }
+        }
 }
