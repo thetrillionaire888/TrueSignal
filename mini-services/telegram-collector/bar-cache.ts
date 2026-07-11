@@ -148,38 +148,90 @@ export async function fetchBarsCached(
   onProgress?.(`fetching from Dukascopy for ${instrument.toUpperCase()}…`);
   let fetched: unknown[] = [];
   try {
-    fetched = (await getHistoricalRates({
+    // Wrap in a 10s timeout — Dukascopy's free API frequently hangs
+    // indefinitely (not just socket errors, but complete stalls).
+    // Without this, the entire evaluation pipeline blocks forever.
+    const FETCH_TIMEOUT = 10_000; // 10 seconds
+    const fetchPromise = getHistoricalRates({
       instrument: instrument as unknown as never,
       dates: { from: fromTime, to: toTime },
       timeframe: timeframe as unknown as never,
       format: "array" as unknown as never,
       priceType: "bid" as unknown as never,
-    })) as unknown as unknown[][];
+    });
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Dukascopy fetch timed out after ${FETCH_TIMEOUT}ms`)), FETCH_TIMEOUT)
+    );
+    fetched = (await Promise.race([fetchPromise, timeoutPromise])) as unknown as unknown[][];
   } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e);
     console.warn(
-      `[bar-cache] Dukascopy fetch failed for ${instrument} ${fromTime.toISOString()}:`,
-      e instanceof Error ? e.message : String(e)
+      `[bar-cache] Dukascopy fetch failed for ${instrument} ${fromTime.toISOString()}: ${errMsg}`
     );
-    // Fall back to whatever we have cached
-    const cachedBars = (stmts.getCachedRange.all({
-      $instrument: instrument,
-      $timeframe: timeframe,
-      $from: fromMs,
-      $to: toMs,
-    }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
-      (r) => ({
-        timestamp: r.timestamp,
-        open: r.open,
-        high: r.high,
-        low: r.low,
-        close: r.close,
-        volume: r.volume,
-      })
-    );
-    return {
-      bars: cachedBars,
-      stats: { cached: cachedBars.length, fetched: 0, total: cachedBars.length },
-    };
+
+    // ── Fallback to Binance for crypto instruments ────────────────────────
+    // Dukascopy is unreliable (hangs, socket errors, rate limiting).
+    // Binance's free REST API is more reliable for crypto pairs.
+    // Dukascopy uses "btcusd" but Binance uses "BTCUSDT" — map back.
+    const binanceSymbol = instrument.toUpperCase().replace("USD", "USDT");
+    const isCrypto = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                       "AVAXUSDT", "LINKUSDT", "DOGEUSDT", "MATICUSDT", "ARBUSDT"]
+                      .includes(binanceSymbol);
+    if (isCrypto) {
+      onProgress?.(`Dukascopy failed — trying Binance fallback for ${binanceSymbol}…`);
+      try {
+        const binanceInterval: Record<string, string> = {
+          m1: "1m", m5: "5m", m15: "15m", m30: "30m", h1: "1h", h4: "4h", d1: "1d",
+        };
+        const bi = binanceInterval[timeframe] ?? "15m";
+        const binanceUrl = new URL("https://api.binance.com/api/v3/klines");
+        binanceUrl.searchParams.set("symbol", binanceSymbol);
+        binanceUrl.searchParams.set("interval", bi);
+        binanceUrl.searchParams.set("startTime", String(fromMs));
+        binanceUrl.searchParams.set("endTime", String(toMs));
+        binanceUrl.searchParams.set("limit", "1000");
+
+        const binanceRes = await fetch(binanceUrl.toString());
+        if (binanceRes.ok) {
+          const binanceData = (await binanceRes.json()) as unknown[][];
+          fetched = binanceData.map((row) => [
+            Number(row[0]),  // timestamp
+            parseFloat(row[1] as string),  // open
+            parseFloat(row[2] as string),  // high
+            parseFloat(row[3] as string),  // low
+            parseFloat(row[4] as string),  // close
+            parseFloat(row[5] as string),  // volume
+          ]);
+          onProgress?.(`Binance fallback: ${fetched.length} bars for ${binanceSymbol}`);
+        }
+      } catch (e2) {
+        console.warn(`[bar-cache] Binance fallback also failed:`, e2 instanceof Error ? e2.message : String(e2));
+      }
+    }
+
+    // If we got bars from Binance fallback, proceed to insert
+    if (fetched.length === 0) {
+      // Fall back to whatever we have cached
+      const cachedBars = (stmts.getCachedRange.all({
+        $instrument: instrument,
+        $timeframe: timeframe,
+        $from: fromMs,
+        $to: toMs,
+      }) as Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>).map(
+        (r) => ({
+          timestamp: r.timestamp,
+          open: r.open,
+          high: r.high,
+          low: r.low,
+          close: r.close,
+          volume: r.volume,
+        })
+      );
+      return {
+        bars: cachedBars,
+        stats: { cached: cachedBars.length, fetched: 0, total: cachedBars.length },
+      };
+    }
   }
 
   // Store fetched bars in the cache (batch-insert in a single transaction).
