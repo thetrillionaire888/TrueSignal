@@ -504,8 +504,10 @@ function saveEvaluationBatch(batch: EvalResult[]) {
   tx();
 }
 
-// ── Parallel 4-worker evaluation runner ──────────────────────────────────────
-const NUM_WORKERS = 4;
+// ── Parallel 8-worker evaluation runner ─────────────────────────────────────
+// 8 workers (up from 4) — the bottleneck is network I/O (Dukascopy API
+// latency), not CPU, so more workers = more parallel HTTP requests.
+const NUM_WORKERS = 8;
 const BATCH_SIZE = 25;
 
 export type EvalProgress = {
@@ -536,25 +538,144 @@ export type EvalProgress = {
 };
 
 /**
- * Worker function: processes a slice of signals, fetching bars + evaluating
- * each, and batch-writing results in groups of BATCH_SIZE inside a single
- * transaction. Returns the worker's local results + cache stats.
+ * Fetch bars from Dukascopy with retry logic (exponential backoff).
+ * Retries up to 3 times on socket connection errors — Dukascopy's free API
+ * frequently drops connections, especially for recent or old date ranges.
+ */
+async function fetchBarsWithRetry(
+  instrument: string,
+  fromTime: Date,
+  hoursForward: number,
+  onProgress?: (msg: string) => void
+): Promise<{ bars: Bar[]; stats: CacheStats }> {
+  const MAX_RETRIES = 3;
+  const BASE_DELAY = 1000; // 1s, 2s, 4s
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const { bars, stats } = await fetchBars(instrument, fromTime, hoursForward, onProgress);
+    // If we got bars (either cached or fetched), return immediately
+    if (bars.length > 0 || stats.fetched > 0) {
+      return { bars, stats };
+    }
+    // Cache miss + fetch returned nothing — could be socket error or empty range
+    // Retry with exponential backoff (but only if we haven't exhausted attempts)
+    if (attempt < MAX_RETRIES - 1) {
+      const delay = BASE_DELAY * Math.pow(2, attempt);
+      onProgress?.(`retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms…`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  // All retries exhausted — return empty
+  return { bars: [], stats: { cached: 0, fetched: 0, total: 0 } };
+}
+
+/**
+ * Pre-fetch bars for all unique instruments in the signal set.
+ * Groups signals by Dukascopy instrument, finds the full date range
+ * (min postedAt → max postedAt + 48h), and fetches one large batch per
+ * instrument. This replaces N per-signal fetches with M per-instrument
+ * fetches (M << N when many signals share the same instrument).
  *
- * Workers interleave on the await boundaries of `fetchBars` (network I/O), so
- * all 4 workers stay busy even though the underlying SQLite connection is
- * single-writer. Writes are serialized but tiny (one tx per 25 rows).
+ * Returns a Map keyed by "instrument|postedAt-ms" → Bar[] for O(1) lookup
+ * during evaluation.
+ */
+async function preFetchBarsByInstrument(
+  signals: SignalRow[],
+  onProgress: (p: EvalProgress) => void,
+  jobId: string
+): Promise<{ barCache: Map<string, Bar[]>; instrumentsFetched: number; barsCached: number; barsFetched: number }> {
+  // Group signals by Dukascopy instrument
+  const instrumentGroups = new Map<string, { signals: SignalRow[]; minTime: Date; maxTime: Date }>();
+
+  for (const signal of signals) {
+    const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
+    if (!dukascopyInstrument) continue;
+
+    if (!instrumentGroups.has(dukascopyInstrument)) {
+      instrumentGroups.set(dukascopyInstrument, { signals: [], minTime: new Date(8e15), maxTime: new Date(0) });
+    }
+    const group = instrumentGroups.get(dukascopyInstrument)!;
+    group.signals.push(signal);
+    const signalTime = parseDbDate(signal.postedAt);
+    if (!isNaN(signalTime.getTime())) {
+      if (signalTime < group.minTime) group.minTime = new Date(signalTime);
+      if (signalTime > group.maxTime) group.maxTime = new Date(signalTime);
+    }
+  }
+
+  // Fetch bars for each instrument (parallel, up to 4 at a time)
+  const barCache = new Map<string, Bar[]>();
+  let instrumentsFetched = 0;
+  let barsCached = 0;
+  let barsFetched = 0;
+  const instruments = Array.from(instrumentGroups.entries());
+
+  onProgress({
+    jobId,
+    phase: "fetching",
+    message: `Pre-fetching bars for ${instruments.length} unique instruments…`,
+    current: 0,
+    total: signals.length,
+  });
+
+  // Process instruments in parallel batches of 4
+  const FETCH_CONCURRENCY = 4;
+  for (let i = 0; i < instruments.length; i += FETCH_CONCURRENCY) {
+    const batch = instruments.slice(i, i + FETCH_CONCURRENCY);
+    await Promise.all(batch.map(async ([instrument, group]) => {
+      // Extend range by 48h forward to cover evaluation window
+      const fromTime = group.minTime;
+      const toTime = new Date(group.maxTime.getTime() + 48 * 3600000);
+      const hoursForward = Math.ceil((toTime.getTime() - fromTime.getTime()) / 3600000);
+
+      const { bars, stats } = await fetchBarsWithRetry(
+        instrument, fromTime, Math.max(hoursForward, 48),
+        (msg) => onProgress({ jobId, phase: "fetching", message: `${instrument.toUpperCase()}: ${msg}`, current: 0, total: signals.length, instrument })
+      );
+
+      instrumentsFetched++;
+      barsCached += stats.cached;
+      barsFetched += stats.fetched;
+
+      // Cache bars per signal by finding the 48h window starting at each signal's postedAt
+      for (const signal of group.signals) {
+        const signalTime = parseDbDate(signal.postedAt);
+        if (isNaN(signalTime.getTime())) continue;
+        const signalEndMs = signalTime.getTime() + 48 * 3600000;
+        const signalBars = bars.filter(b => b.timestamp >= signalTime.getTime() && b.timestamp < signalEndMs);
+        const cacheKey = `${signal.instrument}|${signal.postedAt}`;
+        barCache.set(cacheKey, signalBars);
+      }
+
+      onProgress({
+        jobId,
+        phase: "fetching",
+        message: `Pre-fetched ${instrument.toUpperCase()}: ${bars.length} bars (${stats.cached} cached / ${stats.fetched} fetched) for ${group.signals.length} signals`,
+        current: 0,
+        total: signals.length,
+        instrument,
+      });
+    }));
+  }
+
+  return { barCache, instrumentsFetched, barsCached, barsFetched };
+}
+
+/**
+ * Worker function: processes a slice of signals using pre-fetched bars from
+ * the barCache. No network I/O during evaluation — all bars are already in
+ * memory. Workers interleave only on SQLite write transactions.
  */
 async function runWorker(
   workerId: number,
   workerSignals: SignalRow[],
+  barCache: Map<string, Bar[]>,
   onProgress: (p: EvalProgress) => void,
   jobId: string,
   totalSignals: number,
   progressCounter: { current: number }
-): Promise<{ results: EvalResult[]; cached: number; fetched: number }> {
+): Promise<{ results: EvalResult[] }> {
   const results: EvalResult[] = [];
-  let cached = 0;
-  let fetched = 0;
   const pending: EvalResult[] = [];
 
   for (const signal of workerSignals) {
@@ -563,71 +684,29 @@ async function runWorker(
     const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
 
     if (!dukascopyInstrument) {
-      // Skip instruments we can't map to Dukascopy
       const result: EvalResult = {
-        signalId: signal.signalId,
-        outcome: "invalid",
-        exitPrice: null,
-        exitReason: "unknown_instrument",
-        hitTpLevel: null,
-        maxFavorablePct: null,
-        maxAdversePct: null,
-        rMultiple: 0,
-        pnlPercent: 0,
-        durationMinutes: null,
-        evaluatedAt: new Date().toISOString(),
-        barsAnalyzed: 0,
-        instrument: signal.instrument,
-        dukascopyInstrument: "n/a",
+        signalId: signal.signalId, outcome: "invalid", exitPrice: null, exitReason: "unknown_instrument",
+        hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0,
+        durationMinutes: null, evaluatedAt: new Date().toISOString(), barsAnalyzed: 0,
+        instrument: signal.instrument, dukascopyInstrument: "n/a",
       };
       pending.push(result);
       results.push(result);
-      if (pending.length >= BATCH_SIZE) {
-        saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
-      }
-      if (workerId === 0) {
-        onProgress({
-          jobId,
-          phase: "evaluating",
-          message: `[w${workerId}] Skipping unknown instrument ${signal.instrument}`,
-          current,
-          total: totalSignals,
-          instrument: signal.instrument,
-        });
-      }
+      if (pending.length >= BATCH_SIZE) saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
       continue;
     }
 
-    onProgress({
-      jobId,
-      phase: "fetching",
-      message: `[w${workerId}] Fetching ${dukascopyInstrument.toUpperCase()} m15 bars for ${signal.instrument} ${signal.action}…`,
-      current,
-      total: totalSignals,
-      instrument: signal.instrument,
-    });
+    // Look up pre-fetched bars from cache (O(1) — no network I/O)
+    const cacheKey = `${signal.instrument}|${signal.postedAt}`;
+    const bars = barCache.get(cacheKey) ?? [];
 
-    // Fetch 48h of m15 bars starting from signal post time (uses DB cache)
-    const signalTime = new Date(parseDbDate(signal.postedAt) || Date.now());
-    let cacheMsg = "";
-    const { bars, stats: cacheStats } = await fetchBars(
-      dukascopyInstrument,
-      signalTime,
-      48,
-      (msg) => { cacheMsg = msg; }
-    );
-
-    cached += cacheStats.cached;
-    fetched += cacheStats.fetched;
-
-    onProgress({
-      jobId,
-      phase: "evaluating",
-      message: `[w${workerId}] Evaluating ${signal.instrument} ${signal.action} (entry ${signal.entryPrice}) against ${bars.length} bars… (${cacheMsg || "cache ready"})`,
-      current,
-      total: totalSignals,
-      instrument: signal.instrument,
-    });
+    if (workerId === 0 && current % 10 === 0) {
+      onProgress({
+        jobId, phase: "evaluating",
+        message: `[w${workerId}] Evaluated ${current}/${totalSignals} signals (${bars.length} bars for ${signal.instrument})`,
+        current, total: totalSignals, instrument: signal.instrument,
+      });
+    }
 
     const result = evaluateSignal(signal, bars);
     pending.push(result);
@@ -636,17 +715,10 @@ async function runWorker(
     if (pending.length >= BATCH_SIZE) {
       saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
     }
-
-    // Small delay to avoid hammering Dukascopy
-    await new Promise((r) => setTimeout(r, 300));
   }
 
-  // Flush any remaining results in the batch buffer
-  if (pending.length > 0) {
-    saveEvaluationBatch(pending);
-  }
-
-  return { results, cached, fetched };
+  if (pending.length > 0) saveEvaluationBatch(pending);
+  return { results };
 }
 
 export async function evaluateSignals(
@@ -661,7 +733,7 @@ export async function evaluateSignals(
   onProgress({
     jobId,
     phase: "starting",
-    message: `Found ${signals.length} unevaluated signals to evaluate against Dukascopy historical data. Running ${NUM_WORKERS} parallel workers (batch size ${BATCH_SIZE}).`,
+    message: `Found ${signals.length} unevaluated signals. Will pre-fetch bars by instrument, then evaluate with ${NUM_WORKERS} parallel workers.`,
     total: signals.length,
     current: 0,
   });
@@ -670,17 +742,29 @@ export async function evaluateSignals(
     onProgress({
       jobId,
       phase: "complete",
-      message: "No unevaluated signals found. All signals already have evaluations.",
-      total: 0,
-      current: 0,
+      message: "No unevaluated signals found.",
+      total: 0, current: 0,
       summary: { total: 0, wins: 0, losses: 0, breakeven: 0, invalid: 0, noData: 0, winRate: 0, totalR: 0 },
     });
     return;
   }
 
-  // ── Partition signals across NUM_WORKERS workers (round-robin) ───────────
-  // Round-robin keeps the workload balanced even if signal difficulty varies
-  // (some signals hit cache, others trigger network fetches).
+  // ── Phase 1: Pre-fetch bars by instrument (batch fetch) ──────────────────
+  // Groups all signals by Dukascopy instrument, fetches the full date range
+  // once per instrument (instead of once per signal). Reduces API calls from
+  // N (per-signal) to M (per-instrument) — typically a 10-20× reduction.
+  const { barCache, instrumentsFetched, barsCached, barsFetched } = await preFetchBarsByInstrument(signals, onProgress, jobId);
+
+  onProgress({
+    jobId,
+    phase: "evaluating",
+    message: `Bars pre-fetched: ${instrumentsFetched} instruments, ${barsCached} cached / ${barsFetched} fetched. Starting ${NUM_WORKERS}-worker evaluation…`,
+    current: 0,
+    total: signals.length,
+  });
+
+  // ── Phase 2: Evaluate signals in parallel (8 workers, no network I/O) ────
+  // All bars are in memory — workers only do CPU work + batched DB writes.
   const workerQueues: SignalRow[][] = Array.from({ length: NUM_WORKERS }, () => []);
   for (let i = 0; i < signals.length; i++) {
     workerQueues[i % NUM_WORKERS].push(signals[i]);
@@ -689,16 +773,12 @@ export async function evaluateSignals(
   const progressCounter = { current: 0 };
   const workerResults = await Promise.all(
     workerQueues.map((queue, i) =>
-      runWorker(i, queue, onProgress, jobId, signals.length, progressCounter)
+      runWorker(i, queue, barCache, onProgress, jobId, signals.length, progressCounter)
     )
   );
 
-  // ── Aggregate results from all workers ───────────────────────────────────
+  // ── Aggregate results ────────────────────────────────────────────────────
   const results: EvalResult[] = workerResults.flatMap((r) => r.results);
-  const totalCached = workerResults.reduce((a, b) => a + b.cached, 0);
-  const totalFetched = workerResults.reduce((a, b) => a + b.fetched, 0);
-
-  // Summary
   const wins = results.filter((r) => r.outcome === "win").length;
   const losses = results.filter((r) => r.outcome === "loss").length;
   const breakeven = results.filter((r) => r.outcome === "breakeven").length;
@@ -711,27 +791,14 @@ export async function evaluateSignals(
   onProgress({
     jobId,
     phase: "complete",
-    message: `Evaluation complete. ${wins}W / ${losses}L / ${breakeven}B/E / ${invalid} invalid / ${noData} no data. Win rate: ${(winRate * 100).toFixed(1)}%. Total R: ${totalR.toFixed(2)}. Bars: ${totalCached} cached / ${totalFetched} fetched.`,
+    message: `Evaluation complete. ${wins}W / ${losses}L / ${breakeven}B/E / ${invalid} invalid / ${noData} no data. Win rate: ${(winRate * 100).toFixed(1)}%. Total R: ${totalR.toFixed(2)}. Bars: ${barsCached} cached / ${barsFetched} fetched (${instrumentsFetched} instruments).`,
     current: signals.length,
     total: signals.length,
     summary: {
-      total: signals.length,
-      wins,
-      losses,
-      breakeven,
-      invalid,
-      noData,
-      winRate,
-      totalR: Math.round(totalR * 100) / 100,
-      barsCached: totalCached,
-      barsFetched: totalFetched,
+      total: signals.length, wins, losses, breakeven, invalid, noData, winRate,
+      totalR: Math.round(totalR * 100) / 100, barsCached, barsFetched,
     },
-    results: results.map((r) => ({
-      signalId: r.signalId,
-      instrument: r.instrument,
-      outcome: r.outcome,
-      rMultiple: r.rMultiple,
-    })),
+    results: results.map((r) => ({ signalId: r.signalId, instrument: r.instrument, outcome: r.outcome, rMultiple: r.rMultiple })),
   });
 }
 
