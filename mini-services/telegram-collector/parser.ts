@@ -51,12 +51,15 @@ const TP_LIST_RE = new RegExp("(?:targets?|take\\s*profits?|tps?)\\s*[:\\-]\\s*(
 const TP_RE = new RegExp("(?:take\\s*profit|\\btp\\d*|target|t\\.p\\.?)\\s*[:\\-]?\\s*\\$?\\s*" + NUM, "gi");
 const ENTRY_KEYWORD_RE = new RegExp("(?:entry(?:\\s+(?:sell|buy))?(?:\\s+(?:limit|stop|zone))?|enters?|buy\\s*at|sell\\s*at|ref\\s*price)\\s*[:\\-]?\\s*\\$?\\s*" + NUM, "i");
 const RANGE_KEYWORD_RE = new RegExp("(?:sell|buy)?\\s*(?:range|zone)\\s*[:\\-]?\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
-const ACTION_PRICE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM, "i");
-const ACTION_RANGE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
+// ACTION_PRICE_RE: matches "BUY 4099", "Sell now 4095", "Sell now ! 4095", etc.
+// The [!@:.\s-]* after the optional keyword allows punctuation like "!", "@", ":"
+// between the action/keyword and the price number (common in real signals).
+const ACTION_PRICE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*[!@:.\\s-]*\\$?\\s*" + NUM, "i");
+const ACTION_RANGE_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*[!@:.\\s-]*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
 // ACTION_TWO_NUMBERS_RE: matches "BUY 4099 4095" — two numbers after the action
 // keyword, separated by whitespace. This is a common signal format for range entries
 // where the two numbers are the entry range bounds (e.g. BUY high low or BUY low high).
-const ACTION_TWO_NUMBERS_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*@?\\s*\\$?\\s*" + NUM + "\\s+" + NUM, "i");
+const ACTION_TWO_NUMBERS_RE = new RegExp("(?:buy|sell|long|short)\\s*(?:now|stop|limit|zone)?\\s*[!@:.\\s-]*\\$?\\s*" + NUM + "\\s+" + NUM, "i");
 const AT_RANGE_RE = new RegExp("@\\s*\\$?\\s*" + NUM + "\\s*(?:[-–—to]+|\\s+to\\s+)\\s*\\$?\\s*" + NUM, "i");
 const AT_SINGLE_RE = new RegExp("@\\s*\\$?\\s*" + NUM, "i");
 const TP_OPEN_RE = /\btp\s*[:\-]?\s*open\b/i;
@@ -75,11 +78,13 @@ function extractStopLoss(lines: string[]): number | null {
 
 function extractTakeProfits(lines: string[], text: string, entryPrice: number, stopLoss: number, action: "long" | "short"): { tps: number[]; warnings: string[] } {
   const tps: number[] = []; const warnings: string[] = [];
-  if (TP_OPEN_RE.test(text)) { warnings.push("TP: OPEN — derived 1R, 2R"); }
-  else {
-    for (const line of lines) { const m = line.match(TP_LIST_RE); if (m) { for (const p of m[1].split(/[,;\s]+/)) { if (!p) continue; const v = parseNumber(p); if (isFinite(v) && v > 0) tps.push(v); } if (tps.length > 0) break; } }
-    if (tps.length === 0) { for (const line of lines) { const tpRe = new RegExp(TP_RE.source, "gi"); let m; while ((m = tpRe.exec(line)) !== null) { const v = parseNumber(m[1]); if (isFinite(v) && v > 0) tps.push(v); } } }
-  }
+  // First try to extract explicit TPs from the message — these take priority.
+  // "TP: Open" does NOT suppress explicit TPs; it's only a fallback signal.
+  for (const line of lines) { const m = line.match(TP_LIST_RE); if (m) { for (const p of m[1].split(/[,;\s]+/)) { if (!p) continue; const v = parseNumber(p); if (isFinite(v) && v > 0) tps.push(v); } if (tps.length > 0) break; } }
+  if (tps.length === 0) { for (const line of lines) { const tpRe = new RegExp(TP_RE.source, "gi"); let m; while ((m = tpRe.exec(line)) !== null) { const v = parseNumber(m[1]); if (isFinite(v) && v > 0) tps.push(v); } } }
+  // If no explicit TPs were found AND the message says "TP: Open", derive 1R/2R.
+  if (tps.length === 0 && TP_OPEN_RE.test(text)) { warnings.push("TP: OPEN — derived 1R, 2R"); }
+  // Final fallback: if still no TPs, derive from entry/SL (1R, 2R).
   if (tps.length === 0) { const d = action === "long" ? 1 : -1; const r = Math.abs(entryPrice - stopLoss); tps.push(entryPrice + d * r); tps.push(entryPrice + d * r * 2); if (warnings.length === 0) warnings.push("TPs derived from entry/SL (1R, 2R)"); }
   const validTps = tps.filter((tp) => action === "long" ? tp > entryPrice : tp < entryPrice);
   if (validTps.length === 0) { const d = action === "long" ? 1 : -1; const r = Math.abs(entryPrice - stopLoss); validTps.push(entryPrice + d * r); validTps.push(entryPrice + d * r * 2); warnings.push("All TPs on wrong side — derived 1R, 2R"); }
