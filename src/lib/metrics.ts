@@ -136,28 +136,50 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
   const variance = n ? rs.reduce((a, b) => a + (b - mean) ** 2, 0) / n : 0
   const std = Math.sqrt(variance)
 
-  // Build a daily-aggregated R series for risk-adjusted ratios (standard practice:
-  // aggregate all closed trades per day into one daily return, then annualize by sqrt(252)).
-  const dayMap = new Map<string, number>()
-  for (const r of closed) {
-    const day = r.evaluatedAt.toISOString().slice(0, 10)
-    dayMap.set(day, (dayMap.get(day) ?? 0) + r.rMultiple)
-  }
-  const dailyRs = Array.from(dayMap.values())
-  const dailyMean = dailyRs.length ? dailyRs.reduce((a, b) => a + b, 0) / dailyRs.length : 0
-  const dailyVar = dailyRs.length
-    ? dailyRs.reduce((a, b) => a + (b - dailyMean) ** 2, 0) / dailyRs.length
-    : 0
-  const dailyStd = Math.sqrt(dailyVar)
-  const downsideDaily = dailyRs.filter((r) => r < 0)
-  const downsideDailyVar = downsideDaily.length
-    ? downsideDaily.reduce((a, b) => a + b ** 2, 0) / downsideDaily.length
-    : 0
-  const downsideDailyStd = Math.sqrt(downsideDailyVar)
+  // ── Sharpe & Sortino ratios ──────────────────────────────────────────────
+  //
+  // For trading signals, we compute risk-adjusted ratios using per-trade
+  // R-multiples (not annualized). This is the standard approach for
+  // evaluating signal quality because:
+  //
+  //   1. R-multiples are normalized risk units (1R = amount risked on the
+  //      trade), NOT percentage returns. Annualizing with √252 assumes
+  //      daily percentage returns — applying it to summed daily R-multiples
+  //      produces absurd values (Sharpe of 20+ is unrealistic).
+  //   2. Trading signals may post multiple trades per day. Summing them
+  //      into a "daily return" and then annualizing compounds the error.
+  //   3. Per-trade Sharpe = mean(R) / std(R) is a pure measure of signal
+  //      quality (expectancy vs. variability), independent of trade
+  //      frequency. It's directly comparable across different strategies.
+  //
+  // Interpretation:
+  //   - Sharpe > 0.5  = decent signal quality
+  //   - Sharpe > 1.0  = good
+  //   - Sharpe > 1.5  = excellent
+  //   - Sharpe > 2.0  = exceptional (rare in practice)
+  //
+  // Sortino uses downside deviation (only negative trades) instead of
+  // total std, rewarding consistency on the downside:
+  //   downside dev = sqrt( mean( min(0, R)² ) )  over ALL trades
+  //   (zero-return and positive trades contribute 0 to downside variance)
 
-  const ann = Math.sqrt(252)
-  const sharpe = dailyStd > 0 ? (dailyMean / dailyStd) * ann : 0
-  const sortino = downsideDailyStd > 0 ? (dailyMean / downsideDailyStd) * ann : 0
+  const perTradeRs = closed.map((r) => r.rMultiple)
+  const nTrades = perTradeRs.length
+  const tradeMean = nTrades > 0 ? perTradeRs.reduce((a, b) => a + b, 0) / nTrades : 0
+  const tradeVar = nTrades > 0
+    ? perTradeRs.reduce((a, b) => a + (b - tradeMean) ** 2, 0) / nTrades
+    : 0
+  const tradeStd = Math.sqrt(tradeVar)
+
+  // Downside deviation: sqrt( mean( min(0, R)² ) ) over ALL trades
+  // (positive trades contribute 0; denominator is total trades, not just losers)
+  const downsideVar = nTrades > 0
+    ? perTradeRs.reduce((a, b) => a + Math.min(0, b) ** 2, 0) / nTrades
+    : 0
+  const downsideStd = Math.sqrt(downsideVar)
+
+  const sharpe = tradeStd > 0 ? tradeMean / tradeStd : 0
+  const sortino = downsideStd > 0 ? tradeMean / downsideStd : 0
 
   // Max drawdown in R (computed per-trade, not from the daily-aggregated equity
   // curve). Iterating each trade in postedAt order catches intra-day peaks that the
@@ -173,9 +195,9 @@ export function computeMetrics(rows: EvalRow[]): Metrics {
   }
   const maxDrawdown = Math.abs(tradeMaxDD)
 
-  // Calmar = annualized return / max drawdown (both in R-space, daily mean × 252)
-  const annualizedR = dailyMean * 252
-  const calmar = maxDrawdown > 0 ? annualizedR / maxDrawdown : 0
+  // Calmar = total R / max drawdown (both in R-space, per-trade)
+  // Not annualized — same reasoning as Sharpe (R-multiples aren't percentages)
+  const calmar = maxDrawdown > 0 ? totalR / maxDrawdown : 0
 
   // streaks
   let curWin = 0
