@@ -4,7 +4,7 @@
 
 TrueSignal is a signal audit platform that scrutinizes trading signals — starting with Telegram — and evaluates them against historical market data to reveal their true performance and reliability.
 
-Born from the TrueSignal engine, TrueSignal serves as a beacon of transparency in a world where trading signal claims often go unchecked. By connecting directly to Telegram via MTProto, parsing signals into structured data, and backtesting them against real OHLC bars from Dukascopy, Binance, and Yahoo Finance, TrueSignal exposes whether signals actually work — not just whether they sound good.
+By connecting directly to Telegram via MTProto, parsing signals into structured data, and backtesting them against real OHLC bars from Dukascopy, Binance, and Yahoo Finance, TrueSignal exposes whether signals actually work — not just whether they sound good.
 
 ---
 
@@ -17,7 +17,7 @@ To protect traders by exposing unreliable signals and guiding them toward system
 - **Audit** Telegram trading channels with integrity and transparency
 - **Parse** signals into structured data — single-price entries, range entries, multi-target TPs, market/stop/limit order types
 - **Evaluate** each signal against real historical market data using an entry-type-aware conservative fill model
-- **Reveal** clear analytics that show the truth behind trading claims — win rate, R-multiple, Sharpe, Calmar, drawdown
+- **Reveal** clear analytics that show the truth behind trading claims — win rate, R-multiple, Sharpe, Sortino, Calmar, drawdown
 
 ## Disclaimer
 
@@ -28,18 +28,20 @@ TrueSignal is for **educational purposes only**. It does not provide financial a
 ## Key capabilities
 
 - **MTProto ingestion** — full audit access to Telegram channels, groups, and supergroups via [teleproto](https://github.com/sanyok123456/teleproto) (not the Bot API)
-- **Multi-stage signal parser** — 3-stage cascade pipeline (keyword-structured → action-anchored → price-proximity) handles BUY STOP, BUY LIMIT, SELL STOP, SELL LIMIT, BUY RANGE, SELL RANGE, and compact formats
+- **Multi-stage signal parser** — 3-stage cascade pipeline with punctuation tolerance, range detection ("BUY 4099 4095"), and multi-line TP extraction
 - **Entry-type-aware evaluation** — market orders fill immediately, stop orders fill on breakout, limit orders fill on pullback, range orders fill at conservative edge
-- **3-database architecture** — audit.db (signals/evaluations), catalog.db (channels/stats), market.db (price bars) — each with independent WAL locks for concurrent read/write
-- **Historical evaluation** — fetches real OHLC bars from Dukascopy (with DB caching for speed) to determine win/loss, R-multiple, MFE/MAE
-- **Multi-source data fetching** — Dukascopy, Binance, Yahoo Finance, CSV upload
-- **Parallel evaluation** — 4-worker concurrent evaluation with batched transactional writes
-- **Analytics dashboard** — equity curves, win/loss donuts, R-multiple distributions, monthly heatmaps, MFE-vs-MAE scatter, Sharpe/Sortino/Calmar ratios
-- **Per-trade drawdown** — max drawdown computed per-trade (captures intra-day peaks), not from daily aggregation
-- **Export** — CSV, JSON, XLSX for signals and cached price bars
+- **Per-asset database architecture** — audit.db + catalog.db (ATTACH'd) plus per-asset market DBs (`db/market/{instrument}_{timeframe}.db`) for scalable price bar storage
+- **M1-first evaluation** — evaluator uses M1 bars (highest resolution) when available, with M15 fallback for backward compatibility
+- **Multi-source data fetching with priority** — Crypto: Binance REST, Binance Vision, Dukascopy; Forex/Metals/Indices/Energy: Dukascopy, Yahoo Finance
+- **Chunked CSV import** — handles 400MB+ CSV files via 5MB chunked upload with live progress (no OOM, no connection resets)
+- **Flexible CSV parser** — auto-detects StrategyQuant, ISO 8601, Unix epoch, and Bid/Ask formats with automatic timeframe detection and aggregation
+- **Parallel evaluation** — 8-worker concurrent evaluation with batched transactional writes
+- **Analytics dashboard** — equity curves, win/loss donuts, R-multiple distributions, monthly heatmaps, MFE-vs-MAE scatter, per-trade Sharpe/Sortino/Calmar ratios
+- **Sortable signals table** — click any column header to sort ascending/descending (server-side SQL ORDER BY)
+- **No-data retry** — signals with `no_data` outcome are automatically retried on subsequent batch evaluations
 - **Pause/Resume/Stop** — full control over ingestion with resume-from-position support
 - **Signal deduplication** — prevents duplicate signals via `channelId + postedAt` unique constraint
-- **Unlimited ingestion** — fetch all channel history from establishment to now
+- **Export** — CSV, JSON, XLSX for signals and cached price bars
 
 ---
 
@@ -51,7 +53,7 @@ TrueSignal is for **educational purposes only**. It does not provide financial a
 - [Caddy](https://caddyserver.com/) (optional) — or use Next.js rewrites (no Caddy needed)
 - Telegram API credentials from [my.telegram.org](https://my.telegram.org)
 
-### Install & configure
+### Install and configure
 
 ```bash
 git clone https://github.com/thetrillionaire888/TrueSignal.git truesignal
@@ -63,11 +65,11 @@ cd mini-services/telegram-collector && bun install && cd ../..
 echo 'TELEGRAM_API_ID=your_api_id
 TELEGRAM_API_HASH=your_api_hash' > mini-services/telegram-collector/.env
 
-# Set up the 3 databases
-bun run db:push        # Creates audit.db, catalog.db, market.db with schemas + indexes
+# Set up the databases
+bun run db:push
 
 # (Optional) Seed with demo data
-bun run db:seed        # Populates 8 channels, ~1700 messages, ~1150 signals
+bun run db:seed
 ```
 
 ### Run
@@ -106,8 +108,8 @@ bash scripts/stop-dev.sh --force      # Also kill any process on ports 3000/3001
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](docs/ARCHITECTURE.md) | Service architecture, 3-database design, data flow, technology stack |
-| [Usage Guide](docs/USAGE.md) | How to authenticate, ingest, evaluate, fetch, export, and view analytics |
+| [Architecture](docs/ARCHITECTURE.md) | Service architecture, per-asset database design, data flow, technology stack |
+| [Usage Guide](docs/USAGE.md) | How to authenticate, ingest, evaluate, import, fetch, export, and view analytics |
 | [API Reference](docs/API.md) | Collector HTTP endpoints and Socket.IO events |
 | [Deployment Guide](docs/DEPLOYMENT.md) | Dev launcher, Caddy setup, production build, PM2/systemd, HTTPS/TLS |
 
@@ -118,7 +120,7 @@ bash scripts/stop-dev.sh --force      # Also kill any process on ports 3000/3001
 ```
 src/
 ├── app/
-│   ├── api/                    # Next.js API routes (overview, channels, signals, analytics, export, pipeline)
+│   ├── api/                    # Next.js API routes (overview, channels, signals, analytics, export, pipeline, import-csv-stream)
 │   ├── layout.tsx              # Root layout with theme provider
 │   └── page.tsx                # Main page (view router + drawers)
 ├── components/
@@ -128,59 +130,72 @@ src/
 │   ├── signal-detail-drawer.tsx
 │   └── channel-detail-drawer.tsx
 ├── lib/
-│   ├── db.ts                   # Unified database connection (runtime-aware: bun:sqlite / better-sqlite3)
+│   ├── db.ts                   # Unified database connection (audit.db + catalog.db ATTACH'd)
+│   ├── market-db.ts            # Per-asset market DB connection manager (cached connections)
 │   ├── schema/                 # Drizzle ORM schemas (3 files)
-│   │   ├── audit.ts            # Message, Signal, Evaluation
-│   │   ├── catalog.ts          # Channel, ChannelStats, IngestState
-│   │   └── market.ts           # PriceBar (composite PK)
-│   ├── metrics.ts              # Performance metrics engine (Sharpe, Calmar, per-trade drawdown, equity curves)
-│   ├── queries.ts              # Database query helpers (positional params, cross-DB joins)
-│   ├── collector-client.ts     # Collector API + Socket.IO client
-│   └── store.ts                # Zustand UI state
+│   ├── metrics.ts              # Performance metrics engine (per-trade Sharpe, Sortino, Calmar, equity curves)
+│   ├── queries.ts              # Database query helpers (sortable columns, cross-DB joins)
+│   ├── collector-client.ts     # Collector API + Socket.IO client (ingest, eval, import progress)
+│   └── store.ts                # Zustand UI state (sortable signals, filters)
 mini-services/telegram-collector/
-├── index.ts                    # HTTP API + Socket.IO server
+├── index.ts                    # HTTP API + Socket.IO server (streaming + chunked upload endpoints)
 ├── telegram.ts                 # MTProto client (auth, channel resolution, history iteration)
-├── parser.ts                   # Multi-stage signal parser (3-stage cascade)
-├── evaluator.ts                # Entry-type-aware evaluator (market/stop/limit/range fill logic)
-├── bar-cache.ts                # Read-through OHLC bar cache (market.PriceBar)
+├── parser.ts                   # Multi-stage signal parser (punctuation-tolerant, range detection)
+├── evaluator.ts                # M1-first evaluator (market/stop/limit/range fill logic, 8-worker parallel)
+├── bar-cache.ts                # Multi-source OHLC bar cache (Binance -> Dukascopy -> Yahoo fallback)
+├── csv-parser.ts               # Flexible streaming CSV parser (auto-detects format + timeframe)
 ├── importers.ts                # Binance, Yahoo Finance, CSV importers
 ├── ingestion-state.ts          # Pause/Resume/Stop state manager
 └── db.ts                       # Collector DB operations (uses shared @/lib/db connection)
 scripts/
-├── push-schemas.ts             # Push 3-DB schemas (creates tables + indexes)
-├── migrate-to-split-db.ts      # Migrate from old single custom.db to 3 new DBs
+├── push-schemas.ts             # Push DB schemas (creates tables + indexes)
+├── migrate-to-split-db.ts      # Migrate from old single custom.db to split DBs
+├── migrate-to-per-asset-db.ts  # Migrate market.db -> per-asset DBs
+├── import-xauusd-csv.ts        # Import StrategyQuant XAUUSD CSV (M1 default)
+├── reevaluate-no-data.ts       # Re-evaluate signals with 'no_data' outcome
 ├── seed.ts                     # Demo data seeder (batched transactions)
-├── parser-test.ts              # Parser test suite (28 test cases)
 ├── start-dev.sh                # 3-service dev launcher (background/tmux/split modes)
 └── stop-dev.sh                 # Stop all services (+ optional --force)
 docs/
-├── ARCHITECTURE.md             # Service architecture & 3-database design
-├── USAGE.md                    # How-to guide
-├── API.md                      # Collector API reference
-└── DEPLOYMENT.md               # Dev launcher, Caddy, production, PM2/systemd, HTTPS
+├── ARCHITECTURE.md             # Service architecture and per-asset database design
+├── USAGE.md                    # How-to guide (includes Import Tab + chunked upload)
+├── API.md                      # Collector API reference (includes streaming + chunked endpoints)
+└── DEPLOYMENT.md               # Dev launcher, Caddy (large file config), production, PM2/systemd, HTTPS
 ```
 
 ---
 
 ## Database architecture
 
-TrueSignal uses **3 SQLite databases** — each tuned for its access pattern, with independent WAL locks for concurrent read/write:
+TrueSignal uses **2 ATTACH'd SQLite databases** plus **per-asset market databases** — each tuned for its access pattern, with independent WAL locks for concurrent read/write:
 
 ```
 db/
-├── audit.db      ← Messages + Signals + Evaluations (high-write + high-read)
-├── catalog.db    ← Channels (static) + ChannelStats (volatile) + IngestState (read-heavy)
-├── market.db     ← PriceBars (write-once, read-many, composite PK)
-└── custom.db     ← Old single DB (kept as backup after migration)
+├── audit.db          ← Messages + Signals + Evaluations (high-write + high-read)
+├── catalog.db        ← Channels (static) + ChannelStats (volatile) + IngestState (read-heavy)
+├── market.db         ← Old single market DB (kept as backup after migration)
+└── market/           ← Per-asset databases (one file per instrument+timeframe)
+    ├── xauusd_m1.db      (e.g. 767K M1 bars)
+    ├── xauusd_m15.db     (e.g. 52K M15 bars)
+    ├── btcusd_m15.db
+    ├── eurusd_m15.db
+    └── ... (one per instrument+timeframe combination)
 ```
 
-All 3 are `ATTACH`'d to a single connection — cross-DB queries like `SELECT * FROM catalog.Channel` work natively. No `.env` configuration needed — databases are auto-discovered in the `db/` directory.
+`audit.db` and `catalog.db` are `ATTACH`'d to a single connection — cross-DB queries like `SELECT * FROM catalog.Channel` work natively. Market data is accessed via `@/lib/market-db.ts` which opens and caches per-asset connections on demand.
 
 | Database | Tables | Key Indexes |
 |----------|--------|-------------|
 | audit.db | Message, Signal, Evaluation | Signal.messageId, Message.postedAt, Signal.channelId+status, Evaluation.outcome |
 | catalog.db | Channel, ChannelStats, IngestState | Channel.telegramId (unique), ChannelStats.channelId (PK) |
-| market.db | PriceBar | Composite PK (source, instrument, timeframe, timestamp) — clustered for range scans |
+| market/*.db | PriceBar (one table per file) | Composite PK (source, instrument, timeframe, timestamp) — clustered for range scans |
+
+**Why per-asset databases?**
+- Each file stays small (e.g. `xauusd_m1.db` = 117 MB, not 400 MB in a single file)
+- Per-instrument backup/restore without touching others
+- No SQLite ATTACH limit (10 DBs) — each connection is independent
+- Direct SQLite Browser access to one instrument's data
+- The `source` column inside each DB still tracks provenance (dukascopy, binance, yahoo)
 
 **Runtime-aware driver**: Uses `bun:sqlite` under Bun (collector), `better-sqlite3` under Node.js (Next.js dev server). Both share the same `@/lib/db` connection layer.
 
@@ -193,10 +208,9 @@ bun run dev          # Next.js dev mode (hot reloading, port 3000)
 bun run build        # Production build (creates .next/standalone/)
 bun run start        # Run production server
 bun run lint         # ESLint
-bun run db:push      # Push schemas to all 3 databases
-bun run db:migrate   # Migrate from old single custom.db to 3 new DBs
+bun run db:push      # Push schemas to all databases
+bun run db:migrate   # Migrate from old single custom.db to split DBs
 bun run db:seed      # Seed demo data
-bun scripts/parser-test.ts  # Run parser test suite (28 tests)
 ```
 
 ## License
