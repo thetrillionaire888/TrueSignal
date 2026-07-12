@@ -1,0 +1,855 @@
+     1→     1→// Signal evaluator: fetches historical price data from Dukascopy (with DB
+     2→     2→// caching to avoid re-downloading the same bars) and determines whether each
+     3→     3→// parsed signal resulted in a win (TP hit) or loss (SL hit).
+     4→     4→// Computes R-multiple, MFE, MAE, and duration for each signal.
+     5→     5→//
+     6→     6→// Uses the shared `sqlite` connection from `@/lib/db` (audit.db is the main
+     7→     7→// DB; Signal/Message/Evaluation live there — no prefix needed).
+     8→     8→//
+     9→     9→// Entry-fill model (driven by `entryType` parsed from signal.notes):
+    10→    10→//   - market: fill immediately at the first bar's open
+    11→    11→//   - limit:  buy=triggered when bar.low ≤ entry; sell=triggered when bar.high ≥ entry
+    12→    12→//   - stop:   buy=triggered when bar.high ≥ entry; sell=triggered when bar.low ≤ entry
+    13→    13→//   - range:  walk forward to first range-touch; conservative fill at edge closest to SL
+    14→    14→//
+    15→    15→// Evaluation runs as 4 parallel async workers, each batching writes (25/batch)
+    16→    16→// into a single transaction to amortize COMMIT cost. SQLite writes are
+    17→    17→// serialized on the shared connection; reads happen during the async
+    18→    18→// `fetchBars` await, so workers interleave productively.
+    19→    19→import { sqlite } from "@/lib/db";
+    20→    20→import { cuid } from "./cuid";
+    21→    21→import { fetchBarsCached, type Bar, type CacheStats } from "./bar-cache";
+    22→    22→
+    23→    23→// ── Instrument mapping: our DB instruments → Dukascopy instrument IDs ────────
+    24→    24→const INSTRUMENT_MAP: Record<string, string> = {
+    25→    25→  // Commodities / metals
+    26→    26→  xauusd: "xauusd",
+    27→    27→  xagusd: "xagusd",
+    28→    28→  xptusd: "xptusd",
+    29→    29→  // Crypto — Dukascopy uses 'btcusd' not 'btcusdt'
+    30→    30→  btcusdt: "btcusd",
+    31→    31→  btcusd: "btcusd",
+    32→    32→  ethusdt: "ethusd",
+    33→    33→  ethusd: "ethusd",
+    34→    34→  solusdt: "solusd",
+    35→    35→  bnbusdt: "bnbusd",
+    36→    36→  xrpusdt: "xrpusd",
+    37→    37→  // Forex
+    38→    38→  eurusd: "eurusd",
+    39→    39→  gbpusd: "gbpusd",
+    40→    40→  usdjpy: "usdjpy",
+    41→    41→  audusd: "audusd",
+    42→    42→  usdcad: "usdcad",
+    43→    43→  eurgbp: "eurgbp",
+    44→    44→  eurjpy: "eurjpy",
+    45→    45→  nzdusd: "nzdusd",
+    46→    46→  usdchf: "usdchf",
+    47→    47→  gbpjpy: "gbpjpy",
+    48→    48→  // Indices
+    49→    49→  spx500: "spx500",
+    50→    50→  us30: "us30",
+    51→    51→  nas100: "nas100",
+    52→    52→  ger40: "ger40",
+    53→    53→  // Energy
+    54→    54→  wti: "wtiusd",
+    55→    55→  brent: "brent",
+    56→    56→};
+    57→    57→
+    58→    58→export function toDukascopyInstrument(instrument: string): string | null {
+    59→    59→  const key = instrument.toLowerCase().replace(/z$/, ""); // strip 'z' suffix
+    60→    60→  return INSTRUMENT_MAP[key] ?? null;
+    61→    61→}
+    62→    62→
+    63→    63→// ── Helpers ──────────────────────────────────────────────────────────────────
+    64→    64→
+    65→    65→/**
+    66→    66→ * Parse a date string stored in the DB into epoch milliseconds.
+    67→    67→ * Tolerates both:
+    68→    68→ *   - epoch-millis strings (e.g. "1720425600000") — emitted by some legacy rows
+    69→    69→ *   - ISO 8601 strings (e.g. "2024-07-08T15:20:00.000Z") — the default
+    70→    70→ * Falls back to NaN on garbage input (caller should treat NaN as "now").
+    71→    71→ */
+    72→    72→export function parseDbDate(s: string): Date {
+    73→    73→  if (typeof s === "number") return new Date(s);
+    74→    74→  if (!s) return new Date(NaN);
+    75→    75→  // Pure-digit string → epoch millis
+    76→    76→  if (/^\d+$/.test(s)) return new Date(Number(s));
+    77→    77→  const t = Date.parse(s);
+    78→    78→  return Number.isNaN(t) ? new Date(NaN) : new Date(t);
+    79→    79→}
+    80→    80→
+    81→    81→type EntryType = "stop" | "limit" | "market" | "range";
+    82→    82→
+    83→    83→/**
+    84→    84→ * Extract the entry-type tag from the signal's notes field. The parser can
+    85→    85→ * emit a structured tag like `entryType:stop` / `entryType:limit` /
+    86→    86→ * `entryType:market` / `entryType:range` inside the notes string. Defaults to
+    87→    87→ * `market` (immediate fill) when no tag is present — the most permissive
+    88→    88→ * interpretation.
+    89→    89→ */
+    90→    90→function extractEntryType(notes: string | null | undefined): EntryType {
+    91→    91→  if (!notes) return "market";
+    92→    92→  const m = notes.match(/entryType\s*[:=]\s*(stop|limit|market|range)/i);
+    93→    93→  return (m?.[1].toLowerCase() as EntryType) ?? "market";
+    94→    94→}
+    95→    95→
+    96→    96→// ── Types ────────────────────────────────────────────────────────────────────
+    97→    97→
+    98→    98→export type SignalRow = {
+    99→    99→  signalId: string;
+   100→   100→  messageId: string;
+   101→   101→  channelId: string;
+   102→   102→  instrument: string;
+   103→   103→  action: string;
+   104→   104→  entryPrice: number;
+   105→   105→  entryLow: number | null;
+   106→   106→  entryHigh: number | null;
+   107→   107→  isRange: number; // SQLite stores boolean as 0/1
+   108→   108→  stopLoss: number;
+   109→   109→  takeProfits: string; // JSON array string
+   110→   110→  notes: string | null;
+   111→   111→  postedAt: string;
+   112→   112→};
+   113→   113→
+   114→   114→type EvalResult = {
+   115→   115→  signalId: string;
+   116→   116→  outcome: "win" | "loss" | "breakeven" | "invalid" | "no_data";
+   117→   117→  exitPrice: number | null;
+   118→   118→  exitReason: string | null;
+   119→   119→  hitTpLevel: number | null;
+   120→   120→  maxFavorablePct: number | null;
+   121→   121→  maxAdversePct: number | null;
+   122→   122→  rMultiple: number;
+   123→   123→  pnlPercent: number;
+   124→   124→  durationMinutes: number | null;
+   125→   125→  evaluatedAt: string;
+   126→   126→  barsAnalyzed: number;
+   127→   127→  instrument: string;
+   128→   128→  dukascopyInstrument: string;
+   129→   129→  marketDataSource: string; // e.g. "dukascopy-m1", "binance-m15", "yahoo-m15"
+   130→   130→};
+   131→   131→
+   132→   132→// ── Prepared statements ──────────────────────────────────────────────────────
+   133→   133→// Signal/Message/Evaluation live in audit.db (the main DB, no prefix).
+   134→   134→const stmts = {
+   135→   135→  getUnevaluatedSignals: sqlite.prepare(
+   136→   136→    `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
+   137→   137→            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+   138→   138→            s.notes, m.postedAt
+   139→   139→     FROM Signal s
+   140→   140→     JOIN Message m ON s.messageId = m.id
+   141→   141→     LEFT JOIN Evaluation e ON e.signalId = s.id
+   142→   142→     WHERE e.signalId IS NULL OR e.outcome = 'no_data'
+   143→   143→     ORDER BY m.postedAt ASC`
+   144→   144→  ),
+   145→   145→  getUnevaluatedByChannel: sqlite.prepare(
+   146→   146→    `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
+   147→   147→            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+   148→   148→            s.notes, m.postedAt
+   149→   149→     FROM Signal s
+   150→   150→     JOIN Message m ON s.messageId = m.id
+   151→   151→     LEFT JOIN Evaluation e ON e.signalId = s.id
+   152→   152→     WHERE (e.signalId IS NULL OR e.outcome = 'no_data') AND s.channelId = $channelId
+   153→   153→     ORDER BY m.postedAt ASC`
+   154→   154→  ),
+   155→   155→  insertEvaluation: sqlite.prepare(
+   156→   156→    `INSERT OR REPLACE INTO Evaluation
+   157→   157→       (id, signalId, outcome, exitPrice, exitReason, hitTpLevel,
+   158→   158→        maxFavorablePct, maxAdversePct, rMultiple, pnlPercent, durationMinutes,
+   159→   159→        marketDataSource, evaluatedAt)
+   160→   160→     VALUES ($id, $signalId, $outcome, $exitPrice, $exitReason, $hitTpLevel,
+   161→   161→             $maxFavorablePct, $maxAdversePct, $rMultiple, $pnlPercent, $durationMinutes,
+   162→   162→             $marketDataSource, $evaluatedAt)`
+   163→   163→  ),
+   164→   164→  // Note: the EVAL_CHANNEL_FILTER branch is intentionally inert — preserved
+   165→   165→  // from the original code; the param-binding path is identical either way.
+   166→   166→  countEvaluated: sqlite.prepare(
+   167→   167→    `SELECT COUNT(*) as c FROM Evaluation e
+   168→   168→     JOIN Signal s ON e.signalId = s.id
+   169→   169→     ${process.env.EVAL_CHANNEL_FILTER ? "" : ""}`
+   170→   170→  ),
+   171→   171→  countEvaluatedByChannel: sqlite.prepare(
+   172→   172→    "SELECT COUNT(*) as c FROM Evaluation e JOIN Signal s ON e.signalId = s.id WHERE s.channelId = $channelId"
+   173→   173→  ),
+   174→   174→  countTotalSignals: sqlite.prepare("SELECT COUNT(*) as c FROM Signal"),
+   175→   175→  countTotalSignalsByChannel: sqlite.prepare(
+   176→   176→    "SELECT COUNT(*) as c FROM Signal WHERE channelId = $channelId"
+   177→   177→  ),
+   178→   178→};
+   179→   179→
+   180→   180→// ── Fetch historical bars (with DB caching) ──────────────────────────────────
+   181→   181→// Uses the read-through cache in bar-cache.ts: checks SQLite first, only
+   182→   182→// fetches missing bars from Dukascopy, and stores them for future reuse.
+   183→   183→//
+   184→   184→// Timeframe strategy (M1-first with M15 fallback):
+   185→   185→//   1. Try M1 first — highest resolution, best for precise entry/exit detection.
+   186→   186→//      Used when high-quality M1 data has been imported (e.g. Dukascopy CSV).
+   187→   187→//   2. Fall back to M15 if M1 has no bars — preserves backward compatibility
+   188→   188→//      with the existing m15 cache populated by API fetches.
+   189→   189→//
+   190→   190→// The 48h evaluation window contains:
+   191→   191→//   - M1:  ~2880 bars (one per minute)  — precise but ~15× more data
+   192→   192→//   - M15: ~192 bars (one per 15 min)   — coarser but faster
+   193→   193→export async function fetchBars(
+   194→   194→  instrument: string,
+   195→   195→  fromTime: Date,
+   196→   196→  hoursForward: number,
+   197→   197→  onProgress?: (msg: string) => void,
+   198→   198→  forceRefresh: boolean = false
+   199→   199→): Promise<{ bars: Bar[]; stats: CacheStats }> {
+   200→   200→  const toTime = new Date(fromTime.getTime() + hoursForward * 3600000);
+   201→   201→
+   202→   202→  // Try M1 first (preferred — higher resolution)
+   203→   203→  const m1Result = await fetchBarsCached(instrument, "m1", fromTime, toTime, onProgress, forceRefresh);
+   204→   204→  if (m1Result.bars.length > 0) {
+   205→   205→    return m1Result;
+   206→   206→  }
+   207→   207→
+   208→   208→  // Fall back to M15 (existing cache from API fetches)
+   209→   209→  onProgress?.(`no M1 bars for ${instrument}, falling back to m15`);
+   210→   210→  return fetchBarsCached(instrument, "m15", fromTime, toTime, onProgress, forceRefresh);
+   211→   211→}
+   212→   212→
+   213→   213→// ── Evaluate a single signal against historical bars ────────────────────────
+   214→   214→// Now supports 4 entry-fill models dispatched via `entryType` parsed from the
+   215→   215→// signal's notes field:
+   216→   216→//   - market:  immediate fill at first bar's open
+   217→   217→//   - limit:   buy when bar.low ≤ entry;  sell when bar.high ≥ entry
+   218→   218→//   - stop:    buy when bar.high ≥ entry; sell when bar.low ≤ entry
+   219→   219→//   - range:   walk forward to first range-touch; conservative fill at edge
+   220→   220→//              closest to SL (worst-case R)
+   221→   221→export function evaluateSignal(signal: SignalRow, bars: Bar[], marketDataSource: string = "dukascopy-m15"): EvalResult {
+   222→   222→  const tps = JSON.parse(signal.takeProfits) as number[];
+   223→   223→  const tp = tps.length > 0 ? tps[0] : null; // evaluate against first TP
+   224→   224→  const sl = signal.stopLoss;
+   225→   225→  const isLong = signal.action === "long";
+   226→   226→  const entryType = extractEntryType(signal.notes);
+   227→   227→  const now = new Date().toISOString();
+   228→   228→  const postedAtMs = parseDbDate(signal.postedAt).getTime();
+   229→   229→
+   230→   230→  const base: Partial<EvalResult> = {
+   231→   231→    signalId: signal.signalId,
+   232→   232→    instrument: signal.instrument,
+   233→   233→    dukascopyInstrument: toDukascopyInstrument(signal.instrument) ?? signal.instrument,
+   234→   234→    evaluatedAt: now,
+   235→   235→    barsAnalyzed: bars.length,
+   236→   236→    marketDataSource,
+   237→   237→  };
+   238→   238→
+   239→   239→  if (!tp) {
+   240→   240→    return { ...base, outcome: "invalid", exitPrice: null, exitReason: "no_tp", hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   241→   241→  }
+   242→   242→
+   243→   243→  if (bars.length === 0) {
+   244→   244→    return { ...base, outcome: "no_data", exitPrice: null, exitReason: null, hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   245→   245→  }
+   246→   246→
+   247→   247→  // ── Determine the effective entry price + fill bar index ─────────────────
+   248→   248→  let entry: number = signal.entryPrice;
+   249→   249→  let fillBarIndex = 0;
+   250→   250→
+   251→   251→  if (entryType === "range" && signal.entryLow != null && signal.entryHigh != null) {
+   252→   252→    const entryLow = signal.entryLow;
+   253→   253→    const entryHigh = signal.entryHigh;
+   254→   254→    // Conservative fill: edge closest to SL (worst-case R).
+   255→   255→    //   LONG  → SL is below entry → worst fill = entryLow (closest to SL)
+   256→   256→    //   SHORT → SL is above entry → worst fill = entryHigh (closest to SL)
+   257→   257→    const conservativeFill = isLong ? entryLow : entryHigh;
+   258→   258→
+   259→   259→    let filled = false;
+   260→   260→    for (let i = 0; i < bars.length; i++) {
+   261→   261→      const bar = bars[i];
+   262→   262→      // Range touched = bar's price range overlaps with the entry range
+   263→   263→      if (bar.high >= entryLow && bar.low <= entryHigh) {
+   264→   264→        entry = conservativeFill;
+   265→   265→        fillBarIndex = i;
+   266→   266→        filled = true;
+   267→   267→        break;
+   268→   268→      }
+   269→   269→      // SL hit BEFORE range touched → signal never triggered
+   270→   270→      if (isLong) {
+   271→   271→        if (bar.low <= sl) {
+   272→   272→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   273→   273→        }
+   274→   274→      } else {
+   275→   275→        if (bar.high >= sl) {
+   276→   276→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   277→   277→        }
+   278→   278→      }
+   279→   279→    }
+   280→   280→
+   281→   281→    if (!filled) {
+   282→   282→      return { ...base, outcome: "invalid", exitPrice: null, exitReason: "range_not_touched", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   283→   283→    }
+   284→   284→  } else if (entryType === "market") {
+   285→   285→    // Market entry — fill at the first bar's open (immediate execution).
+   286→   286→    entry = bars[0].open;
+   287→   287→    fillBarIndex = 0;
+   288→   288→  } else if (entryType === "stop") {
+   289→   289→    // Stop entry:
+   290→   290→    //   Buy stop (LONG):  triggers when bar.high ≥ entry (price rises above stop)
+   291→   291→    //   Sell stop (SHORT): triggers when bar.low ≤ entry (price falls below stop)
+   292→   292→    let filled = false;
+   293→   293→    for (let i = 0; i < bars.length; i++) {
+   294→   294→      const bar = bars[i];
+   295→   295→      if (isLong) {
+   296→   296→        if (bar.low <= sl) {
+   297→   297→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   298→   298→        }
+   299→   299→        if (bar.high >= signal.entryPrice) {
+   300→   300→          entry = signal.entryPrice;
+   301→   301→          fillBarIndex = i;
+   302→   302→          filled = true;
+   303→   303→          break;
+   304→   304→        }
+   305→   305→      } else {
+   306→   306→        if (bar.high >= sl) {
+   307→   307→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   308→   308→        }
+   309→   309→        if (bar.low <= signal.entryPrice) {
+   310→   310→          entry = signal.entryPrice;
+   311→   311→          fillBarIndex = i;
+   312→   312→          filled = true;
+   313→   313→          break;
+   314→   314→        }
+   315→   315→      }
+   316→   316→    }
+   317→   317→    if (!filled) {
+   318→   318→      return { ...base, outcome: "invalid", exitPrice: null, exitReason: "stop_not_triggered", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   319→   319→    }
+   320→   320→  } else if (entryType === "limit") {
+   321→   321→    // Limit entry:
+   322→   322→    //   Buy limit (LONG):  triggers when bar.low ≤ entry (price falls to limit)
+   323→   323→    //   Sell limit (SHORT): triggers when bar.high ≥ entry (price rises to limit)
+   324→   324→    let filled = false;
+   325→   325→    for (let i = 0; i < bars.length; i++) {
+   326→   326→      const bar = bars[i];
+   327→   327→      if (isLong) {
+   328→   328→        if (bar.low <= sl) {
+   329→   329→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   330→   330→        }
+   331→   331→        if (bar.low <= signal.entryPrice) {
+   332→   332→          entry = signal.entryPrice;
+   333→   333→          fillBarIndex = i;
+   334→   334→          filled = true;
+   335→   335→          break;
+   336→   336→        }
+   337→   337→      } else {
+   338→   338→        if (bar.high >= sl) {
+   339→   339→          return { ...base, outcome: "invalid", exitPrice: sl, exitReason: "sl_before_entry", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   340→   340→        }
+   341→   341→        if (bar.high >= signal.entryPrice) {
+   342→   342→          entry = signal.entryPrice;
+   343→   343→          fillBarIndex = i;
+   344→   344→          filled = true;
+   345→   345→          break;
+   346→   346→        }
+   347→   347→      }
+   348→   348→    }
+   349→   349→    if (!filled) {
+   350→   350→      return { ...base, outcome: "invalid", exitPrice: null, exitReason: "limit_not_triggered", hitTpLevel: null, maxFavorablePct: 0, maxAdversePct: 0, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   351→   351→    }
+   352→   352→  } else {
+   353→   353→    // Default fallback (no entryType) — treat as immediate market fill.
+   354→   354→    entry = signal.entryPrice;
+   355→   355→    fillBarIndex = 0;
+   356→   356→  }
+   357→   357→
+   358→   358→  // Edge case: SL == entry → risk is 0, can't compute R
+   359→   359→  const risk = Math.abs(entry - sl);
+   360→   360→  if (risk === 0) {
+   361→   361→    return { ...base, outcome: "invalid", exitPrice: null, exitReason: "zero_risk", hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0, durationMinutes: null } as EvalResult;
+   362→   362→  }
+   363→   363→
+   364→   364→  // ── Walk through bars from fill point to find SL/TP hit ──────────────────
+   365→   365→  let exitPrice: number | null = null;
+   366→   366→  let exitReason: string | null = null;
+   367→   367→  let hitTpLevel: number | null = null;
+   368→   368→  let exitTime: number | null = null;
+   369→   369→  let maxFav = 0;
+   370→   370→  let maxAdv = 0;
+   371→   371→
+   372→   372→  for (let i = fillBarIndex; i < bars.length; i++) {
+   373→   373→    const bar = bars[i];
+   374→   374→
+   375→   375→    // Track MFE/MAE from entry
+   376→   376→    if (isLong) {
+   377→   377→      maxFav = Math.max(maxFav, bar.high - entry);
+   378→   378→      maxAdv = Math.max(maxAdv, entry - bar.low);
+   379→   379→    } else {
+   380→   380→      maxFav = Math.max(maxFav, entry - bar.low);
+   381→   381→      maxAdv = Math.max(maxAdv, bar.high - entry);
+   382→   382→    }
+   383→   383→
+   384→   384→    // Check exit conditions (conservative: if both hit in same bar, SL first)
+   385→   385→    if (isLong) {
+   386→   386→      if (bar.low <= sl) {
+   387→   387→        exitPrice = sl;
+   388→   388→        exitReason = "sl";
+   389→   389→        exitTime = bar.timestamp;
+   390→   390→        break;
+   391→   391→      }
+   392→   392→      if (bar.high >= tp) {
+   393→   393→        exitPrice = tp;
+   394→   394→        exitReason = "tp1";
+   395→   395→        hitTpLevel = 1;
+   396→   396→        exitTime = bar.timestamp;
+   397→   397→        break;
+   398→   398→      }
+   399→   399→    } else {
+   400→   400→      if (bar.high >= sl) {
+   401→   401→        exitPrice = sl;
+   402→   402→        exitReason = "sl";
+   403→   403→        exitTime = bar.timestamp;
+   404→   404→        break;
+   405→   405→      }
+   406→   406→      if (bar.low <= tp) {
+   407→   407→        exitPrice = tp;
+   408→   408→        exitReason = "tp1";
+   409→   409→        hitTpLevel = 1;
+   410→   410→        exitTime = bar.timestamp;
+   411→   411→        break;
+   412→   412→      }
+   413→   413→    }
+   414→   414→  }
+   415→   415→
+   416→   416→  // If no exit, signal is still open (use last bar close)
+   417→   417→  if (exitPrice === null) {
+   418→   418→    const lastBar = bars[bars.length - 1];
+   419→   419→    const currentPrice = lastBar.close;
+   420→   420→    const unrealizedR = isLong
+   421→   421→      ? (currentPrice - entry) / risk
+   422→   422→      : (entry - currentPrice) / risk;
+   423→   423→    // If unrealized R is very small, mark breakeven; otherwise mark as still open
+   424→   424→    const durationMin = Number.isNaN(postedAtMs)
+   425→   425→      ? null
+   426→   426→      : Math.round((lastBar.timestamp - postedAtMs) / 60000);
+   427→   427→    if (Math.abs(unrealizedR) < 0.1) {
+   428→   428→      return {
+   429→   429→        ...base,
+   430→   430→        outcome: "breakeven",
+   431→   431→        exitPrice: currentPrice,
+   432→   432→        exitReason: "manual",
+   433→   433→        hitTpLevel: null,
+   434→   434→        maxFavorablePct: (maxFav / entry) * 100,
+   435→   435→        maxAdversePct: (maxAdv / entry) * 100,
+   436→   436→        rMultiple: 0,
+   437→   437→        pnlPercent: 0,
+   438→   438→        durationMinutes: durationMin,
+   439→   439→      } as EvalResult;
+   440→   440→    }
+   441→   441→    // Mark as win/loss based on current direction
+   442→   442→    const outcome = unrealizedR > 0 ? "win" : "loss";
+   443→   443→    return {
+   444→   444→      ...base,
+   445→   445→      outcome,
+   446→   446→      exitPrice: currentPrice,
+   447→   447→      exitReason: "still_open",
+   448→   448→      hitTpLevel: null,
+   449→   449→      maxFavorablePct: (maxFav / entry) * 100,
+   450→   450→      maxAdversePct: (maxAdv / entry) * 100,
+   451→   451→      rMultiple: Math.round(unrealizedR * 100) / 100,
+   452→   452→      pnlPercent: Math.round(unrealizedR * 100) / 100,
+   453→   453→      durationMinutes: durationMin,
+   454→   454→    } as EvalResult;
+   455→   455→  }
+   456→   456→
+   457→   457→  // Compute R-multiple and PnL
+   458→   458→  const rMultiple = isLong
+   459→   459→    ? (exitPrice - entry) / risk
+   460→   460→    : (entry - exitPrice) / risk;
+   461→   461→  const pnlPercent = Math.round(rMultiple * 100) / 100; // 1R = 1% account
+   462→   462→  const durationMinutes = exitTime && !Number.isNaN(postedAtMs)
+   463→   463→    ? Math.round((exitTime - postedAtMs) / 60000)
+   464→   464→    : null;
+   465→   465→
+   466→   466→  return {
+   467→   467→    ...base,
+   468→   468→    outcome: exitReason === "sl" ? "loss" : "win",
+   469→   469→    exitPrice,
+   470→   470→    exitReason,
+   471→   471→    hitTpLevel,
+   472→   472→    maxFavorablePct: Math.round((maxFav / entry) * 10000) / 100,
+   473→   473→    maxAdversePct: Math.round((maxAdv / entry) * 10000) / 100,
+   474→   474→    rMultiple: Math.round(rMultiple * 100) / 100,
+   475→   475→    pnlPercent,
+   476→   476→    durationMinutes,
+   477→   477→  } as EvalResult;
+   478→   478→}
+   479→   479→
+   480→   480→// ── Save evaluation to DB (single-row helper, used outside batches) ─────────
+   481→   481→export function saveEvaluation(result: EvalResult) {
+   482→   482→  stmts.insertEvaluation.run({
+   483→   483→    $id: cuid(),
+   484→   484→    $signalId: result.signalId,
+   485→   485→    $outcome: result.outcome,
+   486→   486→    $exitPrice: result.exitPrice,
+   487→   487→    $exitReason: result.exitReason,
+   488→   488→    $hitTpLevel: result.hitTpLevel,
+   489→   489→    $maxFavorablePct: result.maxFavorablePct,
+   490→   490→    $maxAdversePct: result.maxAdversePct,
+   491→   491→    $rMultiple: result.rMultiple,
+   492→   492→    $pnlPercent: result.pnlPercent,
+   493→   493→    $durationMinutes: result.durationMinutes,
+   494→   494→    $marketDataSource: result.marketDataSource,
+   495→   495→    $evaluatedAt: result.evaluatedAt,
+   496→   496→  });
+   497→   497→}
+   498→   498→
+   499→   499→/**
+   500→   500→ * Save a batch of evaluation results in a single transaction. Amortizes COMMIT
+   501→   501→ * cost across BATCH_SIZE rows — critical for keeping up with the 4-worker
+   502→   502→ * evaluation throughput.
+   503→   503→ */
+   504→   504→function saveEvaluationBatch(batch: EvalResult[]) {
+   505→   505→  if (batch.length === 0) return;
+   506→   506→  const tx = sqlite.transaction(() => {
+   507→   507→    for (const result of batch) {
+   508→   508→      stmts.insertEvaluation.run({
+   509→   509→        $id: cuid(),
+   510→   510→        $signalId: result.signalId,
+   511→   511→        $outcome: result.outcome,
+   512→   512→        $exitPrice: result.exitPrice,
+   513→   513→        $exitReason: result.exitReason,
+   514→   514→        $hitTpLevel: result.hitTpLevel,
+   515→   515→        $maxFavorablePct: result.maxFavorablePct,
+   516→   516→        $maxAdversePct: result.maxAdversePct,
+   517→   517→        $rMultiple: result.rMultiple,
+   518→   518→        $pnlPercent: result.pnlPercent,
+   519→   519→        $durationMinutes: result.durationMinutes,
+   520→   520→        $marketDataSource: result.marketDataSource,
+   521→   521→        $evaluatedAt: result.evaluatedAt,
+   522→   522→      });
+   523→   523→    }
+   524→   524→  });
+   525→   525→  tx();
+   526→   526→}
+   527→   527→
+   528→   528→// ── Parallel 8-worker evaluation runner ─────────────────────────────────────
+   529→   529→// 8 workers (up from 4) — the bottleneck is network I/O (Dukascopy API
+   530→   530→// latency), not CPU, so more workers = more parallel HTTP requests.
+   531→   531→const NUM_WORKERS = 8;
+   532→   532→const BATCH_SIZE = 25;
+   533→   533→
+   534→   534→export type EvalProgress = {
+   535→   535→  jobId: string;
+   536→   536→  phase: "starting" | "fetching" | "evaluating" | "complete" | "error";
+   537→   537→  message: string;
+   538→   538→  current?: number;
+   539→   539→  total?: number;
+   540→   540→  instrument?: string;
+   541→   541→  results?: Array<{
+   542→   542→    signalId: string;
+   543→   543→    instrument: string;
+   544→   544→    outcome: string;
+   545→   545→    rMultiple: number;
+   546→   546→  }>;
+   547→   547→  summary?: {
+   548→   548→    total: number;
+   549→   549→    wins: number;
+   550→   550→    losses: number;
+   551→   551→    breakeven: number;
+   552→   552→    invalid: number;
+   553→   553→    noData: number;
+   554→   554→    winRate: number;
+   555→   555→    totalR: number;
+   556→   556→    barsCached?: number;
+   557→   557→    barsFetched?: number;
+   558→   558→  };
+   559→   559→};
+   560→   560→
+   561→   561→/**
+   562→   562→ * Fetch bars from Dukascopy with retry logic (exponential backoff).
+   563→   563→ * Retries up to 3 times on socket connection errors — Dukascopy's free API
+   564→   564→ * frequently drops connections, especially for recent or old date ranges.
+   565→   565→ */
+   566→   566→async function fetchBarsWithRetry(
+   567→   567→  instrument: string,
+   568→   568→  fromTime: Date,
+   569→   569→  hoursForward: number,
+   570→   570→  onProgress?: (msg: string) => void
+   571→   571→): Promise<{ bars: Bar[]; stats: CacheStats }> {
+   572→   572→  const MAX_RETRIES = 3;
+   573→   573→  const BASE_DELAY = 1000; // 1s, 2s, 4s
+   574→   574→
+   575→   575→  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+   576→   576→    const { bars, stats } = await fetchBars(instrument, fromTime, hoursForward, onProgress);
+   577→   577→    // If we got bars (either cached or fetched), return immediately
+   578→   578→    if (bars.length > 0 || stats.fetched > 0) {
+   579→   579→      return { bars, stats };
+   580→   580→    }
+   581→   581→    // Cache miss + fetch returned nothing — could be socket error or empty range
+   582→   582→    // Retry with exponential backoff (but only if we haven't exhausted attempts)
+   583→   583→    if (attempt < MAX_RETRIES - 1) {
+   584→   584→      const delay = BASE_DELAY * Math.pow(2, attempt);
+   585→   585→      onProgress?.(`retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms…`);
+   586→   586→      await new Promise((r) => setTimeout(r, delay));
+   587→   587→    }
+   588→   588→  }
+   589→   589→  // All retries exhausted — return empty
+   590→   590→  return { bars: [], stats: { cached: 0, fetched: 0, total: 0 } };
+   591→   591→}
+   592→   592→
+   593→   593→/**
+   594→   594→ * Pre-fetch bars for all unique instruments in the signal set.
+   595→   595→ * Groups signals by Dukascopy instrument, finds the full date range
+   596→   596→ * (min postedAt → max postedAt + 48h), and fetches one large batch per
+   597→   597→ * instrument. This replaces N per-signal fetches with M per-instrument
+   598→   598→ * fetches (M << N when many signals share the same instrument).
+   599→   599→ *
+   600→   600→ * Returns a Map keyed by "instrument|postedAt-ms" → Bar[] for O(1) lookup
+   601→   601→ * during evaluation.
+   602→   602→ */
+   603→   603→async function preFetchBarsByInstrument(
+   604→   604→  signals: SignalRow[],
+   605→   605→  onProgress: (p: EvalProgress) => void,
+   606→   606→  jobId: string
+   607→   607→): Promise<{ barCache: Map<string, Bar[]>; sourceMap: Map<string, string>; instrumentsFetched: number; barsCached: number; barsFetched: number }> {
+   608→   608→  // Group signals by Dukascopy instrument
+   609→   609→  const instrumentGroups = new Map<string, { signals: SignalRow[]; minTime: Date; maxTime: Date }>();
+   610→   610→
+   611→   611→  for (const signal of signals) {
+   612→   612→    const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
+   613→   613→    if (!dukascopyInstrument) continue;
+   614→   614→
+   615→   615→    if (!instrumentGroups.has(dukascopyInstrument)) {
+   616→   616→      instrumentGroups.set(dukascopyInstrument, { signals: [], minTime: new Date(8e15), maxTime: new Date(0) });
+   617→   617→    }
+   618→   618→    const group = instrumentGroups.get(dukascopyInstrument)!;
+   619→   619→    group.signals.push(signal);
+   620→   620→    const signalTime = parseDbDate(signal.postedAt);
+   621→   621→    if (!isNaN(signalTime.getTime())) {
+   622→   622→      if (signalTime < group.minTime) group.minTime = new Date(signalTime);
+   623→   623→      if (signalTime > group.maxTime) group.maxTime = new Date(signalTime);
+   624→   624→    }
+   625→   625→  }
+   626→   626→
+   627→   627→  // Fetch bars for each instrument (parallel, up to 4 at a time)
+   628→   628→  const barCache = new Map<string, Bar[]>();
+   629→   629→  const sourceMap = new Map<string, string>(); // cacheKey → source label (e.g. "dukascopy-m1")
+   630→   630→  let instrumentsFetched = 0;
+   631→   631→  let barsCached = 0;
+   632→   632→  let barsFetched = 0;
+   633→   633→  const instruments = Array.from(instrumentGroups.entries());
+   634→   634→
+   635→   635→  onProgress({
+   636→   636→    jobId,
+   637→   637→    phase: "fetching",
+   638→   638→    message: `Pre-fetching bars for ${instruments.length} unique instruments…`,
+   639→   639→    current: 0,
+   640→   640→    total: signals.length,
+   641→   641→  });
+   642→   642→
+   643→   643→  // Process instruments in parallel batches of 4
+   644→   644→  const FETCH_CONCURRENCY = 4;
+   645→   645→  for (let i = 0; i < instruments.length; i += FETCH_CONCURRENCY) {
+   646→   646→    const batch = instruments.slice(i, i + FETCH_CONCURRENCY);
+   647→   647→    await Promise.all(batch.map(async ([instrument, group]) => {
+   648→   648→      // Extend range by 48h forward to cover evaluation window
+   649→   649→      const fromTime = group.minTime;
+   650→   650→      const toTime = new Date(group.maxTime.getTime() + 48 * 3600000);
+   651→   651→      const hoursForward = Math.ceil((toTime.getTime() - fromTime.getTime()) / 3600000);
+   652→   652→
+   653→   653→      const { bars, stats } = await fetchBarsWithRetry(
+   654→   654→        instrument, fromTime, Math.max(hoursForward, 48),
+   655→   655→        (msg) => onProgress({ jobId, phase: "fetching", message: `${instrument.toUpperCase()}: ${msg}`, current: 0, total: signals.length, instrument })
+   656→   656→      );
+   657→   657→
+   658→   658→      instrumentsFetched++;
+   659→   659→      barsCached += stats.cached;
+   660→   660→      barsFetched += stats.fetched;
+   661→   661→
+   662→   662→      // Derive the source label from stats.source (e.g. "Binance REST" → "binance")
+   663→   663→      // and the timeframe (m1 or m15, inferred from bar interval if available).
+   664→   664→      // Default to "dukascopy-m15" for backward compatibility.
+   665→   665→      const sourceLabel = stats.source
+   666→   666→        ? stats.source.toLowerCase().split(" ")[0] // "Binance REST" → "binance"
+   667→   667→        : "dukascopy";
+   668→   668→      // Detect timeframe from bar gaps if we have bars
+   669→   669→      let timeframe = "m15";
+   670→   670→      if (bars.length >= 2) {
+   671→   671→        const gap = bars[1].timestamp - bars[0].timestamp;
+   672→   672→        if (gap === 60000) timeframe = "m1";
+   673→   673→        else if (gap === 900000) timeframe = "m15";
+   674→   674→      }
+   675→   675→      const marketDataSource = `${sourceLabel}-${timeframe}`;
+   676→   676→
+   677→   677→      // Cache bars per signal by finding the 48h window starting at each signal's postedAt
+   678→   678→      for (const signal of group.signals) {
+   679→   679→        const signalTime = parseDbDate(signal.postedAt);
+   680→   680→        if (isNaN(signalTime.getTime())) continue;
+   681→   681→        const signalEndMs = signalTime.getTime() + 48 * 3600000;
+   682→   682→        const signalBars = bars.filter(b => b.timestamp >= signalTime.getTime() && b.timestamp < signalEndMs);
+   683→   683→        const cacheKey = `${signal.instrument}|${signal.postedAt}`;
+   684→   684→        barCache.set(cacheKey, signalBars);
+   685→   685→        sourceMap.set(cacheKey, marketDataSource);
+   686→   686→      }
+   687→   687→
+   688→   688→      onProgress({
+   689→   689→        jobId,
+   690→   690→        phase: "fetching",
+   691→   691→        message: `Pre-fetched ${instrument.toUpperCase()}: ${bars.length} bars (${stats.cached} cached / ${stats.fetched} fetched, source=${marketDataSource}) for ${group.signals.length} signals`,
+   692→   692→        current: 0,
+   693→   693→        total: signals.length,
+   694→   694→        instrument,
+   695→   695→      });
+   696→   696→    }));
+   697→   697→  }
+   698→   698→
+   699→   699→  return { barCache, sourceMap, instrumentsFetched, barsCached, barsFetched };
+   700→   700→}
+   701→   701→
+   702→   702→/**
+   703→   703→ * Worker function: processes a slice of signals using pre-fetched bars from
+   704→   704→ * the barCache. No network I/O during evaluation — all bars are already in
+   705→   705→ * memory. Workers interleave only on SQLite write transactions.
+   706→   706→ */
+   707→   707→async function runWorker(
+   708→   708→  workerId: number,
+   709→   709→  workerSignals: SignalRow[],
+   710→   710→  barCache: Map<string, Bar[]>,
+   711→   711→  sourceMap: Map<string, string>,
+   712→   712→  onProgress: (p: EvalProgress) => void,
+   713→   713→  jobId: string,
+   714→   714→  totalSignals: number,
+   715→   715→  progressCounter: { current: number }
+   716→   716→): Promise<{ results: EvalResult[] }> {
+   717→   717→  const results: EvalResult[] = [];
+   718→   718→  const pending: EvalResult[] = [];
+   719→   719→
+   720→   720→  for (const signal of workerSignals) {
+   721→   721→    progressCounter.current++;
+   722→   722→    const current = progressCounter.current;
+   723→   723→    const dukascopyInstrument = toDukascopyInstrument(signal.instrument);
+   724→   724→
+   725→   725→    if (!dukascopyInstrument) {
+   726→   726→      const result: EvalResult = {
+   727→   727→        signalId: signal.signalId, outcome: "invalid", exitPrice: null, exitReason: "unknown_instrument",
+   728→   728→        hitTpLevel: null, maxFavorablePct: null, maxAdversePct: null, rMultiple: 0, pnlPercent: 0,
+   729→   729→        durationMinutes: null, evaluatedAt: new Date().toISOString(), barsAnalyzed: 0,
+   730→   730→        instrument: signal.instrument, dukascopyInstrument: "n/a",
+   731→   731→        marketDataSource: "n/a",
+   732→   732→      };
+   733→   733→      pending.push(result);
+   734→   734→      results.push(result);
+   735→   735→      if (pending.length >= BATCH_SIZE) saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
+   736→   736→      continue;
+   737→   737→    }
+   738→   738→
+   739→   739→    // Look up pre-fetched bars from cache (O(1) — no network I/O)
+   740→   740→    const cacheKey = `${signal.instrument}|${signal.postedAt}`;
+   741→   741→    const bars = barCache.get(cacheKey) ?? [];
+   742→   742→
+   743→   743→    if (workerId === 0 && current % 10 === 0) {
+   744→   744→      onProgress({
+   745→   745→        jobId, phase: "evaluating",
+   746→   746→        message: `[w${workerId}] Evaluated ${current}/${totalSignals} signals (${bars.length} bars for ${signal.instrument})`,
+   747→   747→        current, total: totalSignals, instrument: signal.instrument,
+   748→   748→      });
+   749→   749→    }
+   750→   750→
+   751→   751→    const result = evaluateSignal(signal, bars, sourceMap.get(cacheKey) ?? "dukascopy-m15");
+   752→   752→    pending.push(result);
+   753→   753→    results.push(result);
+   754→   754→
+   755→   755→    if (pending.length >= BATCH_SIZE) {
+   756→   756→      saveEvaluationBatch(pending.splice(0, BATCH_SIZE));
+   757→   757→    }
+   758→   758→  }
+   759→   759→
+   760→   760→  if (pending.length > 0) saveEvaluationBatch(pending);
+   761→   761→  return { results };
+   762→   762→}
+   763→   763→
+   764→   764→export async function evaluateSignals(
+   765→   765→  channelId: string | null,
+   766→   766→  onProgress: (p: EvalProgress) => void
+   767→   767→): Promise<void> {
+   768→   768→  const jobId = `eval-${Date.now()}`;
+   769→   769→  const signals: SignalRow[] = channelId
+   770→   770→    ? (stmts.getUnevaluatedByChannel.all({ $channelId: channelId }) as SignalRow[])
+   771→   771→    : (stmts.getUnevaluatedSignals.all() as SignalRow[]);
+   772→   772→
+   773→   773→  onProgress({
+   774→   774→    jobId,
+   775→   775→    phase: "starting",
+   776→   776→    message: `Found ${signals.length} unevaluated signals. Will pre-fetch bars by instrument, then evaluate with ${NUM_WORKERS} parallel workers.`,
+   777→   777→    total: signals.length,
+   778→   778→    current: 0,
+   779→   779→  });
+   780→   780→
+   781→   781→  if (signals.length === 0) {
+   782→   782→    onProgress({
+   783→   783→      jobId,
+   784→   784→      phase: "complete",
+   785→   785→      message: "No unevaluated signals found.",
+   786→   786→      total: 0, current: 0,
+   787→   787→      summary: { total: 0, wins: 0, losses: 0, breakeven: 0, invalid: 0, noData: 0, winRate: 0, totalR: 0 },
+   788→   788→    });
+   789→   789→    return;
+   790→   790→  }
+   791→   791→
+   792→   792→  // ── Phase 1: Pre-fetch bars by instrument (batch fetch) ──────────────────
+   793→   793→  // Groups all signals by Dukascopy instrument, fetches the full date range
+   794→   794→  // once per instrument (instead of once per signal). Reduces API calls from
+   795→   795→  // N (per-signal) to M (per-instrument) — typically a 10-20× reduction.
+   796→   796→  const { barCache, sourceMap, instrumentsFetched, barsCached, barsFetched } = await preFetchBarsByInstrument(signals, onProgress, jobId);
+   797→   797→
+   798→   798→  onProgress({
+   799→   799→    jobId,
+   800→   800→    phase: "evaluating",
+   801→   801→    message: `Bars pre-fetched: ${instrumentsFetched} instruments, ${barsCached} cached / ${barsFetched} fetched. Starting ${NUM_WORKERS}-worker evaluation…`,
+   802→   802→    current: 0,
+   803→   803→    total: signals.length,
+   804→   804→  });
+   805→   805→
+   806→   806→  // ── Phase 2: Evaluate signals in parallel (8 workers, no network I/O) ────
+   807→   807→  // All bars are in memory — workers only do CPU work + batched DB writes.
+   808→   808→  const workerQueues: SignalRow[][] = Array.from({ length: NUM_WORKERS }, () => []);
+   809→   809→  for (let i = 0; i < signals.length; i++) {
+   810→   810→    workerQueues[i % NUM_WORKERS].push(signals[i]);
+   811→   811→  }
+   812→   812→
+   813→   813→  const progressCounter = { current: 0 };
+   814→   814→  const workerResults = await Promise.all(
+   815→   815→    workerQueues.map((queue, i) =>
+   816→   816→      runWorker(i, queue, barCache, sourceMap, onProgress, jobId, signals.length, progressCounter)
+   817→   817→    )
+   818→   818→  );
+   819→   819→
+   820→   820→  // ── Aggregate results ────────────────────────────────────────────────────
+   821→   821→  const results: EvalResult[] = workerResults.flatMap((r) => r.results);
+   822→   822→  const wins = results.filter((r) => r.outcome === "win").length;
+   823→   823→  const losses = results.filter((r) => r.outcome === "loss").length;
+   824→   824→  const breakeven = results.filter((r) => r.outcome === "breakeven").length;
+   825→   825→  const invalid = results.filter((r) => r.outcome === "invalid").length;
+   826→   826→  const noData = results.filter((r) => r.outcome === "no_data").length;
+   827→   827→  const totalR = results.reduce((a, b) => a + b.rMultiple, 0);
+   828→   828→  const decisive = wins + losses;
+   829→   829→  const winRate = decisive > 0 ? wins / decisive : 0;
+   830→   830→
+   831→   831→  onProgress({
+   832→   832→    jobId,
+   833→   833→    phase: "complete",
+   834→   834→    message: `Evaluation complete. ${wins}W / ${losses}L / ${breakeven}B/E / ${invalid} invalid / ${noData} no data. Win rate: ${(winRate * 100).toFixed(1)}%. Total R: ${totalR.toFixed(2)}. Bars: ${barsCached} cached / ${barsFetched} fetched (${instrumentsFetched} instruments).`,
+   835→   835→    current: signals.length,
+   836→   836→    total: signals.length,
+   837→   837→    summary: {
+   838→   838→      total: signals.length, wins, losses, breakeven, invalid, noData, winRate,
+   839→   839→      totalR: Math.round(totalR * 100) / 100, barsCached, barsFetched,
+   840→   840→    },
+   841→   841→    results: results.map((r) => ({ signalId: r.signalId, instrument: r.instrument, outcome: r.outcome, rMultiple: r.rMultiple })),
+   842→   842→  });
+   843→   843→}
+   844→   844→
+   845→   845→// ── Stats endpoint ────────────────────────────────────────────────────────────
+   846→   846→export function getEvalStats(channelId?: string) {
+   847→   847→  const total = channelId
+   848→   848→    ? (stmts.countTotalSignalsByChannel.get({ $channelId: channelId }) as { c: number }).c
+   849→   849→    : (stmts.countTotalSignals.get() as { c: number }).c;
+   850→   850→  const evaluated = channelId
+   851→   851→    ? (stmts.countEvaluatedByChannel.get({ $channelId: channelId }) as { c: number }).c
+   852→   852→    : (stmts.countEvaluated.get() as { c: number }).c;
+   853→   853→  return { total, evaluated, pending: total - evaluated };
+   854→   854→}
+   855→   855→
