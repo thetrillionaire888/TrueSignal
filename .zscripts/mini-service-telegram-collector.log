@@ -1,0 +1,27 @@
+[telegram-collector] Installing dependencies...
+bun install v1.3.14 (0d9b296a)
+Resolving dependencies
+Resolved, downloaded and extracted [2]
+Saved lockfile
+
++ backtest-kit@15.2.0
++ drizzle-orm@0.45.2
++ dukascopy-node@1.46.4
++ socket.io@4.8.3
++ teleproto@1.227.4
+
+69 packages installed [930.00ms]
+[telegram-collector] Running bun run dev...
+$ bun index.ts
+10 | 
+11 | const API_ID = Number(process.env.TELEGRAM_API_ID);
+12 | const API_HASH = process.env.TELEGRAM_API_HASH ?? "";
+13 | 
+14 | if (!API_ID || !API_HASH) {
+15 |   throw new Error(
+                 ^
+error: Missing TELEGRAM_API_ID / TELEGRAM_API_HASH. Set them in mini-services/telegram-collector/.env (see https://my.telegram.org → API development tools)
+      at /home/z/my-project/mini-services/telegram-collector/telegram.ts:15:13
+
+Bun v1.3.14 (Linux x64 baseline)
+error: script "dev" exited with code 1

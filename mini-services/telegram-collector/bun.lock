@@ -6,6 +6,7 @@
       "name": "telegram-collector",
       "dependencies": {
         "backtest-kit": "^15.2.0",
+        "drizzle-orm": "^0.45.2",
         "dukascopy-node": "^1.46.4",
         "socket.io": "^4.7.5",
         "teleproto": "^1.227.4",
@@ -60,6 +61,8 @@
     "di-scoped": ["di-scoped@1.0.21", "", { "peerDependencies": { "typescript": "^5.0.0" } }, "sha512-VbCZkbQiMppmPXMziotMoEkHBK7HNr7DSdghLp8iFLumomQvxqzSxzsYOknbbpbLsyo5fRIq+oQgnyj3S99hlw=="],
 
     "di-singleton": ["di-singleton@1.0.5", "", { "peerDependencies": { "typescript": "^5.0.0" } }, "sha512-P7KhYEG7rFlTcZyKp9tCrQGYUSjtgIG7Acc0ZAdUBwKXQGhxnjPbTq+fpWSvFfty3AL8UBzUHDznGLorLCYGOA=="],
+
+    "drizzle-orm": ["drizzle-orm@0.45.2", "", { "peerDependencies": { "@aws-sdk/client-rds-data": ">=3", "@cloudflare/workers-types": ">=4", "@electric-sql/pglite": ">=0.2.0", "@libsql/client": ">=0.10.0", "@libsql/client-wasm": ">=0.10.0", "@neondatabase/serverless": ">=0.10.0", "@op-engineering/op-sqlite": ">=2", "@opentelemetry/api": "^1.4.1", "@planetscale/database": ">=1.13", "@prisma/client": "*", "@tidbcloud/serverless": "*", "@types/better-sqlite3": "*", "@types/pg": "*", "@types/sql.js": "*", "@upstash/redis": ">=1.34.7", "@vercel/postgres": ">=0.8.0", "@xata.io/client": "*", "better-sqlite3": ">=7", "bun-types": "*", "expo-sqlite": ">=14.0.0", "gel": ">=2", "knex": "*", "kysely": "*", "mysql2": ">=2", "pg": ">=8", "postgres": ">=3", "prisma": "*", "sql.js": ">=1", "sqlite3": ">=5" }, "optionalPeers": ["@aws-sdk/client-rds-data", "@cloudflare/workers-types", "@electric-sql/pglite", "@libsql/client", "@libsql/client-wasm", "@neondatabase/serverless", "@op-engineering/op-sqlite", "@opentelemetry/api", "@planetscale/database", "@prisma/client", "@tidbcloud/serverless", "@types/better-sqlite3", "@types/pg", "@types/sql.js", "@upstash/redis", "@vercel/postgres", "@xata.io/client", "better-sqlite3", "bun-types", "expo-sqlite", "gel", "knex", "kysely", "mysql2", "pg", "postgres", "prisma", "sql.js", "sqlite3"] }, "sha512-kY0BSaTNYWnoDMVoyY8uxmyHjpJW1geOmBMdSSicKo9CIIWkSxMIj2rkeSR51b8KAPB7m+qysjuHme5nKP+E5Q=="],
 
     "dukascopy-node": ["dukascopy-node@1.46.4", "", { "dependencies": { "chalk": "3.0.0", "cli-progress": "3.10.0", "commander": "5.0.0", "dayjs": "1.11.10", "debug": "4.3.4", "fastest-validator": "1.10.0", "fs-extra": "10.1.0", "lzma-purejs-requirejs": "1.0.0" }, "bin": { "dukascopy-cli": "dist/cli/index.js", "dukascopy-node": "dist/cli/index.js" } }, "sha512-lpjEE/WG2Q/tpVQpvs2B2CMr2MKZHNAGFI7wHu9U7j3b3N0FdC0BoOUu2NxiUXTZF/HAptpjw6BMpwnPGFx9vQ=="],
 
