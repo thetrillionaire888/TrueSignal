@@ -98,17 +98,20 @@ export function ChannelDetailDrawer() {
     if (!selectedChannelId) return
     setReevalStatus({ loading: true })
     try {
+      // Send forceReevaluate=true to re-evaluate ALL signals for this channel
+      // (not just unevaluated/no_data ones). Uses the preloaded M1 data.
       await collectorFetch<any>('/api/evaluate', {
-        method: 'POST', json: { channelId: selectedChannelId },
+        method: 'POST', json: { channelId: selectedChannelId, forceReevaluate: true },
       })
       setReevalStatus({ loading: false, started: true })
-      // Invalidate after a delay (evaluation runs async)
+      // Invalidate after a delay (evaluation runs async with 8 workers)
+      // Use a longer timeout since re-evaluating ALL signals takes time
       setTimeout(() => {
         qc.invalidateQueries({ queryKey: ['channel-detail', selectedChannelId] })
         qc.invalidateQueries({ queryKey: ['channels'] })
         qc.invalidateQueries({ queryKey: ['overview'] })
         setReevalStatus({ loading: false, started: false })
-      }, 5000)
+      }, 15000)
     } catch (e) {
       setReevalStatus({ loading: false, error: e instanceof Error ? e.message : String(e) })
     }
@@ -191,7 +194,7 @@ export function ChannelDetailDrawer() {
             {reevalStatus.started && (
               <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Evaluation started — results will appear shortly.
+                Re-evaluating ALL signals for this channel using preloaded M1 data — results will appear shortly.
               </div>
             )}
             {reevalStatus.error && (

@@ -152,6 +152,31 @@ const stmts = {
      WHERE (e.signalId IS NULL OR e.outcome = 'no_data') AND s.channelId = $channelId
      ORDER BY m.postedAt ASC`
   ),
+  // For force re-evaluation: get ALL signals for a channel (regardless of existing evaluation)
+  getAllSignalsByChannel: sqlite.prepare(
+    `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
+            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+            s.notes, m.postedAt
+     FROM Signal s
+     JOIN Message m ON s.messageId = m.id
+     WHERE s.channelId = $channelId
+     ORDER BY m.postedAt ASC`
+  ),
+  // For force re-evaluation: get ALL signals (regardless of existing evaluation)
+  getAllSignals: sqlite.prepare(
+    `SELECT s.id as signalId, s.messageId, s.channelId, s.instrument, s.action,
+            s.entryPrice, s.entryLow, s.entryHigh, s.isRange, s.stopLoss, s.takeProfits,
+            s.notes, m.postedAt
+     FROM Signal s
+     JOIN Message m ON s.messageId = m.id
+     ORDER BY m.postedAt ASC`
+  ),
+  // Delete all evaluations for a specific channel (used before force re-evaluation)
+  deleteEvaluationsByChannel: sqlite.prepare(
+    `DELETE FROM Evaluation WHERE signalId IN (SELECT id FROM Signal WHERE channelId = $channelId)`
+  ),
+  // Delete all evaluations (used before global force re-evaluation)
+  deleteAllEvaluations: sqlite.prepare(`DELETE FROM Evaluation`),
   insertEvaluation: sqlite.prepare(
     `INSERT OR REPLACE INTO Evaluation
        (id, signalId, outcome, exitPrice, exitReason, hitTpLevel,
@@ -763,12 +788,28 @@ async function runWorker(
 
 export async function evaluateSignals(
   channelId: string | null,
-  onProgress: (p: EvalProgress) => void
+  onProgress: (p: EvalProgress) => void,
+  forceReevaluate: boolean = false
 ): Promise<void> {
   const jobId = `eval-${Date.now()}`;
-  const signals: SignalRow[] = channelId
-    ? (stmts.getUnevaluatedByChannel.all({ $channelId: channelId }) as SignalRow[])
-    : (stmts.getUnevaluatedSignals.all() as SignalRow[]);
+
+  // If force re-evaluation, delete existing evaluations first and get ALL signals
+  let signals: SignalRow[];
+  if (forceReevaluate) {
+    if (channelId) {
+      onProgress({ jobId, phase: "starting", message: `Deleting existing evaluations for channel…`, total: 0, current: 0 });
+      stmts.deleteEvaluationsByChannel.run({ $channelId: channelId });
+      signals = stmts.getAllSignalsByChannel.all({ $channelId: channelId }) as SignalRow[];
+    } else {
+      onProgress({ jobId, phase: "starting", message: `Deleting all existing evaluations…`, total: 0, current: 0 });
+      stmts.deleteAllEvaluations.run();
+      signals = stmts.getAllSignals.all() as SignalRow[];
+    }
+  } else {
+    signals = channelId
+      ? (stmts.getUnevaluatedByChannel.all({ $channelId: channelId }) as SignalRow[])
+      : (stmts.getUnevaluatedSignals.all() as SignalRow[]);
+  }
 
   onProgress({
     jobId,

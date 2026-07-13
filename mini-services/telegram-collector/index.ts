@@ -265,11 +265,12 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     // ── Evaluate signals against Dukascopy historical data ─────────────────
     if (path === "/api/evaluate" && req.method === "POST") {
       const channelId = (body.channelId as string) || null;
+      const forceReevaluate = Boolean(body.forceReevaluate);
       // Run evaluation asynchronously, stream progress via socket.io
       const jobId = `eval-${Date.now()}`;
       evaluateSignals(channelId, (p: EvalProgress) => {
         io.emit("evaluate:progress", p);
-      }).catch((e) => {
+      }, forceReevaluate).catch((e) => {
         console.error("Evaluation error:", e);
         io.emit("evaluate:progress", {
           jobId,
@@ -277,7 +278,7 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
           message: e instanceof Error ? e.message : String(e),
         } as EvalProgress);
       });
-      return json(res, 200, { jobId, message: "Evaluation started", channelId });
+      return json(res, 200, { jobId, message: forceReevaluate ? "Re-evaluation started (all signals)" : "Evaluation started", channelId, forceReevaluate });
     }
 
     // ── Re-evaluate a single signal by ID ───────────────────────────────────
