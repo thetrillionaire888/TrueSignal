@@ -8,6 +8,14 @@ import { Button } from '@/components/ui/button'
 import { ActionBadge, OutcomeBadge, RMultiple } from '@/components/badges'
 import { ChannelAvatar, VerifiedTick } from '@/components/channel-avatar'
 import { useUI } from '@/lib/store'
+import {
+  createChart,
+  CandlestickSeries,
+  LineStyle,
+  type IChartApi,
+  type ISeriesApi,
+  type Time,
+} from 'lightweight-charts'
 import { collectorFetch } from '@/lib/collector-client'
 import { fmtPrice, fmtPct, fmtDuration, fmtDateTime, parseTPs, fmtInt, CATEGORY_META } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -30,7 +38,6 @@ import {
   AlertCircle,
   Copy,
   Check,
-  CandlestickChart as CandlestickChartIcon,
 } from 'lucide-react'
 
 type Detail = {
@@ -422,10 +429,7 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-// ── Candlestick Chart with Entry/SL/TP/Exit overlay ─────────────────────────
-// Fetches the 48h evaluation window of M1 or M15 bars for the signal's
-// instrument and renders a candlestick chart with horizontal lines for
-// entry, SL, each TP, and the exit price.
+// ── Candlestick Chart with Entry/SL/TP/Exit overlay (TradingView LWC) ──────
 type Bar = { timestamp: number; open: number; high: number; low: number; close: number }
 
 function CandlestickChart({
@@ -447,10 +451,13 @@ function CandlestickChart({
   outcome: string
   action: string
 }) {
+  const containerRef = React.useRef<HTMLDivElement>(null)
+  const chartRef = React.useRef<IChartApi | null>(null)
   const [bars, setBars] = React.useState<Bar[]>([])
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
+  // Fetch bars for the 48h evaluation window
   React.useEffect(() => {
     let cancelled = false
     const fetchBars = async () => {
@@ -484,6 +491,141 @@ function CandlestickChart({
     return () => { cancelled = true }
   }, [signalId, instrument, postedAt])
 
+  // Create and render the chart when bars are loaded
+  React.useEffect(() => {
+    if (!containerRef.current || bars.length === 0) return
+
+    // Create chart
+    const chart = createChart(containerRef.current, {
+      width: containerRef.current.clientWidth,
+      height: 260,
+      layout: {
+        background: { color: 'transparent' },
+        textColor: 'rgb(150, 150, 150)',
+        fontSize: 10,
+      },
+      grid: {
+        vertLines: { color: 'rgba(150, 150, 150, 0.1)' },
+        horzLines: { color: 'rgba(150, 150, 150, 0.1)' },
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(150, 150, 150, 0.2)',
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+      },
+      timeScale: {
+        borderColor: 'rgba(150, 150, 150, 0.2)',
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      crosshair: { mode: 1 },
+    })
+    chartRef.current = chart
+
+    // Add candlestick series
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: '#10b981',
+      downColor: '#ef4444',
+      borderUpColor: '#10b981',
+      borderDownColor: '#ef4444',
+      wickUpColor: '#10b981',
+      wickDownColor: '#ef4444',
+    })
+
+    // Set candlestick data (lightweight-charts expects time in seconds)
+    const candleData = bars.map(b => ({
+      time: Math.floor(b.timestamp / 1000) as Time,
+      open: b.open,
+      high: b.high,
+      low: b.low,
+      close: b.close,
+    }))
+    candleSeries.setData(candleData)
+
+    // Add price lines for entry, SL, TPs, exit
+    // Entry (blue, solid)
+    candleSeries.createPriceLine({
+      price: entry,
+      color: '#3b82f6',
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+      title: 'Entry',
+    })
+
+    // Range bounds (blue, dashed)
+    if (isRange && entryLow != null) {
+      candleSeries.createPriceLine({
+        price: entryLow,
+        color: '#3b82f6',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: 'Range L',
+      })
+    }
+    if (isRange && entryHigh != null) {
+      candleSeries.createPriceLine({
+        price: entryHigh,
+        color: '#3b82f6',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: 'Range H',
+      })
+    }
+
+    // SL (red, dashed)
+    candleSeries.createPriceLine({
+      price: sl,
+      color: '#ef4444',
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: 'SL',
+    })
+
+    // TPs (green, dashed)
+    tps.forEach((tp, i) => {
+      candleSeries.createPriceLine({
+        price: tp,
+        color: '#10b981',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `TP${i + 1}`,
+      })
+    })
+
+    // Exit (colored, solid)
+    if (exitPrice != null) {
+      const exitColor = outcome === 'win' ? '#10b981' : outcome === 'loss' ? '#ef4444' : '#f59e0b'
+      candleSeries.createPriceLine({
+        price: exitPrice,
+        color: exitColor,
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `Exit (${exitReason ?? outcome})`,
+      })
+    }
+
+    chart.timeScale().fitContent()
+
+    // Responsive resize
+    const resizeObserver = new ResizeObserver(() => {
+      if (containerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({ width: containerRef.current.clientWidth })
+      }
+    })
+    resizeObserver.observe(containerRef.current)
+
+    return () => {
+      resizeObserver.disconnect()
+      chart.remove()
+      chartRef.current = null
+    }
+  }, [bars, entry, entryLow, entryHigh, isRange, sl, tps, exitPrice, exitReason, outcome])
+
   if (loading) {
     return (
       <div className="mt-3 flex items-center justify-center rounded-lg border border-border/50 bg-muted/20 py-8">
@@ -502,146 +644,25 @@ function CandlestickChart({
     )
   }
 
-  // Chart dimensions
-  const W = 520
-  const H = 200
-  const padding = { top: 10, right: 70, bottom: 25, left: 10 }
-  const chartW = W - padding.left - padding.right
-  const chartH = H - padding.top - padding.bottom
-
-  // Price range: include all bars + entry/SL/TPs/exit
-  const allPrices = [
-    ...bars.flatMap(b => [b.high, b.low]),
-    entry, sl, ...tps,
-  ]
-  if (exitPrice != null) allPrices.push(exitPrice)
-  if (entryLow != null) allPrices.push(entryLow)
-  if (entryHigh != null) allPrices.push(entryHigh)
-
-  const minPrice = Math.min(...allPrices)
-  const maxPrice = Math.max(...allPrices)
-  const priceRange = maxPrice - minPrice || 1
-  const padPrice = priceRange * 0.05
-  const yMin = minPrice - padPrice
-  const yMax = maxPrice + padPrice
-  const yRange = yMax - yMin
-
-  const yToPx = (price: number) => padding.top + chartH - ((price - yMin) / yRange) * chartH
-  const xToPx = (i: number) => padding.left + (i / Math.max(1, bars.length - 1)) * chartW
-
-  // Sample bars if too many (keep max ~120 candles for readability)
-  const displayBars = bars.length > 120
-    ? bars.filter((_, i) => i % Math.ceil(bars.length / 120) === 0)
-    : bars
-
-  const candleW = Math.max(2, (chartW / displayBars.length) * 0.7)
-  const isLong = action === 'long'
-
-  // Price line helper
-  const PriceLine = ({ price, color, label, dashed }: { price: number; color: string; label: string; dashed?: boolean }) => (
-    <g>
-      <line
-        x1={padding.left} y1={yToPx(price)} x2={W - padding.right} y2={yToPx(price)}
-        stroke={color} strokeWidth={1} strokeDasharray={dashed ? '4 2' : undefined} opacity={0.8}
-      />
-      <text x={W - padding.right + 4} y={yToPx(price) + 3} fontSize={9} fill={color} className="font-medium">
-        {label}
-      </text>
-    </g>
-  )
-
-  // Time axis labels (start, mid, end)
-  const timeLabels = [0, Math.floor(displayBars.length / 2), displayBars.length - 1]
-    .filter(i => i < displayBars.length)
-    .map(i => {
-      const d = new Date(displayBars[i].timestamp)
-      const label = d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-      return { x: xToPx(i), label }
-    })
-
   return (
     <div className="mt-3 rounded-lg border border-border/50 bg-muted/10 p-3">
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <CandlestickChartIcon className="h-3.5 w-3.5" />
-        Price Movement ({displayBars.length} bars · {instrument.toUpperCase()})
-      </div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '220px' }}>
-        {/* Candlesticks */}
-        {displayBars.map((bar, i) => {
-          const x = xToPx(i)
-          const isUp = bar.close >= bar.open
-          const color = isUp ? '#10b981' : '#ef4444'
-          const yHigh = yToPx(bar.high)
-          const yLow = yToPx(bar.low)
-          const yOpen = yToPx(bar.open)
-          const yClose = yToPx(bar.close)
-          const bodyTop = Math.min(yOpen, yClose)
-          const bodyH = Math.max(1, Math.abs(yClose - yOpen))
-          return (
-            <g key={i}>
-              <line x1={x} y1={yHigh} x2={x} y2={yLow} stroke={color} strokeWidth={0.8} />
-              <rect
-                x={x - candleW / 2} y={bodyTop}
-                width={candleW} height={bodyH}
-                fill={color} opacity={0.8}
-              />
-            </g>
-          )
-        })}
-
-        {/* Entry line */}
-        <PriceLine price={entry} color="#3b82f6" label={`Entry ${fmtPrice(entry)}`} />
-
-        {/* Range entry bounds */}
-        {isRange && entryLow != null && entryHigh != null && (
-          <>
-            <PriceLine price={entryLow} color="#3b82f6" label={`Range L`} dashed />
-            <PriceLine price={entryHigh} color="#3b82f6" label={`Range H`} dashed />
-          </>
-        )}
-
-        {/* SL line */}
-        <PriceLine price={sl} color="#ef4444" label={`SL ${fmtPrice(sl)}`} dashed />
-
-        {/* TP lines */}
-        {tps.map((tp, i) => (
-          <PriceLine key={i} price={tp} color="#10b981" label={`TP${i + 1}`} dashed />
-        ))}
-
-        {/* Exit marker */}
-        {exitPrice != null && (
-          <g>
-            <circle
-              cx={W - padding.right - 5} cy={yToPx(exitPrice)} r={4}
-              fill={outcome === 'win' ? '#10b981' : outcome === 'loss' ? '#ef4444' : '#f59e0b'}
-              stroke="white" strokeWidth={1}
-            />
-            <text x={W - padding.right - 12} y={yToPx(exitPrice) - 6} fontSize={9} fill={outcome === 'win' ? '#10b981' : outcome === 'loss' ? '#ef4444' : '#f59e0b'} textAnchor="end" className="font-medium">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[11px] font-medium text-muted-foreground">
+          Price Movement ({bars.length} bars · {instrument.toUpperCase()})
+        </span>
+        <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+          <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-blue-500" /> Entry</span>
+          <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-rose-500" /> SL</span>
+          <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-emerald-500" /> TP</span>
+          {exitPrice != null && (
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-full" style={{ background: outcome === 'win' ? '#10b981' : outcome === 'loss' ? '#ef4444' : '#f59e0b' }} />
               Exit
-            </text>
-          </g>
-        )}
-
-        {/* Time axis */}
-        {timeLabels.map((t, i) => (
-          <text key={i} x={t.x} y={H - 8} fontSize={8} fill="currentColor" textAnchor="middle" className="text-muted-foreground">
-            {t.label}
-          </text>
-        ))}
-      </svg>
-
-      {/* Legend */}
-      <div className="mt-2 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
-        <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-blue-500" /> Entry</span>
-        <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-rose-500" /> SL</span>
-        <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-emerald-500" /> TP</span>
-        {exitPrice != null && (
-          <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full" style={{ background: outcome === 'win' ? '#10b981' : outcome === 'loss' ? '#ef4444' : '#f59e0b' }} />
-            Exit ({exitReason})
-          </span>
-        )}
+            </span>
+          )}
+        </div>
       </div>
+      <div ref={containerRef} className="w-full" />
     </div>
   )
 }
