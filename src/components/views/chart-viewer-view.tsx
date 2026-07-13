@@ -287,9 +287,13 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
       wickDownColor: '#ef4444',
     })
 
+    // Sort ASC by timestamp and deduplicate (multiple sources can have
+    // bars at the same timestamp — lightweight-charts requires unique,
+    // ascending timestamps)
     const candleData = bars
       .slice()
       .sort((a, b) => a.timestamp - b.timestamp)
+      .filter((b, i, arr) => i === 0 || b.timestamp !== arr[i - 1].timestamp)
       .map(b => ({
         time: Math.floor(b.timestamp / 1000) as Time,
         open: b.open, high: b.high, low: b.low, close: b.close,

@@ -531,10 +531,11 @@ function CandlestickChart({
       wickDownColor: '#ef4444',
     })
 
-    // Set candlestick data (lightweight-charts expects time in seconds, ASC ordered)
+    // Set candlestick data (lightweight-charts expects time in seconds, ASC ordered, unique)
     const candleData = bars
       .slice()
       .sort((a, b) => a.timestamp - b.timestamp)
+      .filter((b, i, arr) => i === 0 || b.timestamp !== arr[i - 1].timestamp)
       .map(b => ({
         time: Math.floor(b.timestamp / 1000) as Time,
         open: b.open,
