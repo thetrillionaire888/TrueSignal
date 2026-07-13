@@ -255,8 +255,9 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
       setLoading(true)
       setError(null)
       try {
-        const fromMs = new Date(data.message.postedAt).getTime()
-        const toMs = fromMs + 48 * 3600000
+        const postedMs = new Date(data.message.postedAt).getTime()
+        const fromMs = postedMs - 24 * 3600000 // 24h before signal for pre-context
+        const toMs = postedMs + 48 * 3600000   // 48h after signal for evaluation window
         const params = new URLSearchParams({
           XTransformPort: '3001',
           instrument: data.instrument,
