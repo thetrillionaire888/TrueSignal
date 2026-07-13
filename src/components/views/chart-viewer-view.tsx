@@ -259,8 +259,10 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
       setLoading(true)
       setError(null)
       try {
-        const postedMs = new Date(data.message.postedAt).getTime()
-        const fromMs = postedMs - 24 * 3600000 // 24h before signal for pre-context
+        // Parse postedAt — could be epoch-ms string or ISO string
+        const postedDate = new Date(typeof data.message.postedAt === 'number' ? data.message.postedAt : data.message.postedAt)
+        const postedMs = postedDate.getTime()
+        const fromMs = postedMs - 12 * 3600000 // 12h before signal for pre-context
         const toMs = postedMs + 48 * 3600000   // 48h after signal for evaluation window
         const params = new URLSearchParams({
           XTransformPort: '3001',
@@ -342,7 +344,7 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
     // Use a LineSeries with a single vertical segment to mark when the
     // signal was posted. The line spans from the lowest to highest price
     // at the postedAt timestamp.
-    const postedTime = Math.floor(new Date(data.message.postedAt).getTime() / 1000) as Time
+    const postedTime = Math.floor(new Date(typeof data.message.postedAt === 'number' ? data.message.postedAt : data.message.postedAt).getTime() / 1000) as Time
     const allHighs = bars.map(b => b.high)
     const allLows = bars.map(b => b.low)
     const chartMax = Math.max(...allHighs, data.entryPrice, data.stopLoss, ...tps)

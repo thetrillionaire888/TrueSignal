@@ -464,8 +464,10 @@ function CandlestickChart({
       setLoading(true)
       setError(null)
       try {
-        const postedMs = new Date(postedAt).getTime()
-        const fromMs = postedMs - 24 * 3600000 // 24h before signal for pre-context
+        // Parse postedAt — could be epoch-ms string or ISO string
+        const postedDate = new Date(typeof postedAt === 'number' ? postedAt : postedAt)
+        const postedMs = postedDate.getTime()
+        const fromMs = postedMs - 12 * 3600000 // 12h before signal for pre-context
         const toMs = postedMs + 48 * 3600000   // 48h after signal for evaluation window
         const params = new URLSearchParams({
           XTransformPort: '3001',
