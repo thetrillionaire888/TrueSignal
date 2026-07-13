@@ -26,6 +26,7 @@ import {
   AlertCircle,
   Info,
   Loader2,
+  RefreshCw,
   BarChart3,
   LineChart,
   ListChecks,
@@ -106,7 +107,7 @@ export function DataManagerView() {
   return (
     <div className="space-y-5">
       <Tabs value={tab} onValueChange={setTab}>
-        <TabsList className="grid w-full grid-cols-5 max-w-2xl">
+        <TabsList className="grid w-full grid-cols-6 max-w-3xl">
           <TabsTrigger value="fetch" className="gap-1.5">
             <CloudDownload className="h-3.5 w-3.5" />
             Fetch
@@ -127,6 +128,10 @@ export function DataManagerView() {
             <BarChart3 className="h-3.5 w-3.5" />
             Analyze
           </TabsTrigger>
+          <TabsTrigger value="nodata" className="gap-1.5">
+            <AlertCircle className="h-3.5 w-3.5" />
+            No Data
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="fetch" className="mt-5">
@@ -143,6 +148,9 @@ export function DataManagerView() {
         </TabsContent>
         <TabsContent value="analyze" className="mt-5">
           <AnalyzeTab />
+        </TabsContent>
+        <TabsContent value="nodata" className="mt-5">
+          <NoDataTab />
         </TabsContent>
       </Tabs>
     </div>
@@ -880,6 +888,196 @@ function ImportTab() {
           )}
         </div>
       </ChartCard>
+    </div>
+  )
+}
+
+// ── No Data Tab (Follow-up for no_data signals) ─────────────────────────────
+
+type NoDataResponse = {
+  total: number
+  affectedInstruments: number
+  affectedChannels: number
+  instruments: Array<{
+    instrument: string
+    count: number
+    channels: string[]
+    earliestSignal: string | null
+    latestSignal: string | null
+    signalIds: string[]
+    marketDataStatus: 'available' | 'partial' | 'missing'
+    marketDataRange: { earliest: string; latest: string } | null
+    marketDataTimeframes: string[]
+  }>
+}
+
+function NoDataTab() {
+  const { data, isLoading, refetch } = useQuery<NoDataResponse>({
+    queryKey: ['no-data-signals'],
+    queryFn: async () => (await fetch('/api/no-data-signals?XTransformPort=3001')).json(),
+    staleTime: 30_000,
+  })
+
+  const [reevalStatus, setReevalStatus] = React.useState<{ loading: boolean; instrument?: string; done?: boolean; error?: string }>({})
+
+  const handleReevaluate = async (instrument: string) => {
+    setReevalStatus({ loading: true, instrument })
+    try {
+      await collectorFetch<any>('/api/evaluate', {
+        method: 'POST',
+        json: { forceReevaluate: true },
+      })
+      setReevalStatus({ loading: false, instrument, done: true })
+      setTimeout(() => {
+        refetch()
+        setReevalStatus({})
+      }, 15000)
+    } catch (e) {
+      setReevalStatus({ loading: false, instrument, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  if (isLoading) {
+    return (
+      <ChartCard title="No Data Signals" description="Loading...">
+        <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading no-data signals...
+        </div>
+      </ChartCard>
+    )
+  }
+
+  if (!data || data.total === 0) {
+    return (
+      <ChartCard title="No Data Signals" description="Signals that failed evaluation due to missing market data">
+        <div className="flex flex-col items-center gap-3 py-12 text-center">
+          <CheckCircle2 className="h-10 w-10 text-emerald-500" />
+          <div>
+            <p className="text-sm font-medium text-foreground">All signals have data</p>
+            <p className="text-xs text-muted-foreground">No signals with 'no_data' outcome found.</p>
+          </div>
+        </div>
+      </ChartCard>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Summary KPIs */}
+      <div className="grid grid-cols-3 gap-3">
+        <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
+        <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
+        <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
+      </div>
+
+      {/* Per-instrument cards */}
+      <div className="space-y-3">
+        {data.instruments.map((inst) => (
+          <ChartCard
+            key={inst.instrument}
+            title={inst.instrument.toUpperCase()}
+            description={`${inst.count} signal${inst.count > 1 ? 's' : ''} with no_data outcome`}
+          >
+            <div className="space-y-3">
+              {/* Signal date range + channels */}
+              <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Earliest Signal</div>
+                  <div className="font-medium">{inst.earliestSignal ? fmtDateTime(inst.earliestSignal) : '—'}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Latest Signal</div>
+                  <div className="font-medium">{inst.latestSignal ? fmtDateTime(inst.latestSignal) : '—'}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Channels</div>
+                  <div className="font-medium">{inst.channels.join(', ')}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase text-muted-foreground">Eval Window</div>
+                  <div className="font-medium">48h forward</div>
+                </div>
+              </div>
+
+              {/* Market data status */}
+              <div className={cn(
+                'flex items-start gap-2 rounded-lg border p-3 text-xs',
+                inst.marketDataStatus === 'available' ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400' :
+                inst.marketDataStatus === 'partial' ? 'border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-400' :
+                'border-rose-500/30 bg-rose-500/5 text-rose-600 dark:text-rose-400'
+              )}>
+                {inst.marketDataStatus === 'available' ? (
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : inst.marketDataStatus === 'partial' ? (
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : (
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                )}
+                <div className="flex-1">
+                  {inst.marketDataStatus === 'available' && (
+                    <span className="font-medium">Market data available</span>
+                  )}
+                  {inst.marketDataStatus === 'partial' && (
+                    <span className="font-medium">Market data partial</span>
+                  )}
+                  {inst.marketDataStatus === 'missing' && (
+                    <span className="font-medium">No market data found</span>
+                  )}
+                  {inst.marketDataRange ? (
+                    <div className="mt-1">
+                      Available: {fmtDateTime(inst.marketDataRange.earliest)} → {fmtDateTime(inst.marketDataRange.latest)}
+                      {inst.marketDataTimeframes.length > 0 && (
+                        <span className="ml-2 text-muted-foreground">({inst.marketDataTimeframes.join(', ')})</span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mt-1">No market data in any per-asset DB for {inst.instrument.toUpperCase()}</div>
+                  )}
+                  {inst.marketDataStatus === 'partial' && (
+                    <div className="mt-1">
+                      Data doesn't fully cover the signal's evaluation window. Import more data or re-evaluate.
+                    </div>
+                  )}
+                  {inst.marketDataStatus === 'missing' && (
+                    <div className="mt-1">
+                      Use the Import tab to upload CSV data for {inst.instrument.toUpperCase()}, or use the Fetch tab to pull from Binance/Dukascopy/Yahoo.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Action button */}
+              <div className="flex items-center gap-2">
+                {inst.marketDataStatus !== 'missing' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleReevaluate(inst.instrument)}
+                    disabled={reevalStatus.loading && reevalStatus.instrument === inst.instrument}
+                    className="gap-1.5"
+                  >
+                    {reevalStatus.loading && reevalStatus.instrument === inst.instrument ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    Re-evaluate {inst.instrument.toUpperCase()}
+                  </Button>
+                )}
+                {reevalStatus.done && reevalStatus.instrument === inst.instrument && (
+                  <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                    <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
+                    Re-evaluation started — refresh in 15s
+                  </span>
+                )}
+                {reevalStatus.error && reevalStatus.instrument === inst.instrument && (
+                  <span className="text-xs text-rose-600 dark:text-rose-400">{reevalStatus.error}</span>
+                )}
+              </div>
+            </div>
+          </ChartCard>
+        ))}
+      </div>
     </div>
   )
 }

@@ -703,6 +703,121 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
       return json(res, 200, summary);
     }
 
+    // ── No-data signals follow-up (for Data Manager > No Data tab) ──────────
+    // Returns all signals with outcome='no_data', grouped by instrument.
+    // For each instrument, checks if market data exists in the per-asset DBs.
+    if (path === "/api/no-data-signals" && req.method === "GET") {
+      try {
+        // Get all no_data signals with their postedAt + channel info
+        const signals = sqlite.prepare(`
+          SELECT s.id, s.instrument, s.channelId, m.postedAt,
+                 c.name as channelName
+          FROM Signal s
+          JOIN Message m ON s.messageId = m.id
+          JOIN catalog.Channel c ON s.channelId = c.id
+          JOIN Evaluation e ON e.signalId = s.id
+          WHERE e.outcome = 'no_data'
+          ORDER BY m.postedAt DESC
+        `).all() as Array<{
+          id: string; instrument: string; channelId: string;
+          postedAt: string; channelName: string;
+        }>;
+
+        // Group by instrument
+        const byInstrument = new Map<string, {
+          instrument: string;
+          count: number;
+          channels: Set<string>;
+          earliestSignal: string | null;
+          latestSignal: string | null;
+          signalIds: string[];
+        }>();
+
+        for (const s of signals) {
+          if (!byInstrument.has(s.instrument)) {
+            byInstrument.set(s.instrument, {
+              instrument: s.instrument,
+              count: 0,
+              channels: new Set(),
+              earliestSignal: null,
+              latestSignal: null,
+              signalIds: [],
+            });
+          }
+          const g = byInstrument.get(s.instrument)!;
+          g.count++;
+          g.channels.add(s.channelName);
+          g.signalIds.push(s.id);
+          if (!g.earliestSignal || s.postedAt < g.earliestSignal) g.earliestSignal = s.postedAt;
+          if (!g.latestSignal || s.postedAt > g.latestSignal) g.latestSignal = s.postedAt;
+        }
+
+        // For each instrument, check market data availability
+        const { listMarketDbs, getMarketDbSync } = await import("@/lib/market-db");
+        const marketDbs = listMarketDbs();
+        const instruments = Array.from(byInstrument.values()).map((g) => {
+          // Check if any market DB exists for this instrument
+          const matchingDbs = marketDbs.filter(d => d.instrument === g.instrument.toLowerCase());
+          let marketDataStatus: "available" | "partial" | "missing" = "missing";
+          let marketDataRange: { earliest: number; latest: number } | null = null;
+          let marketDataTimeframes: string[] = [];
+
+          if (matchingDbs.length > 0) {
+            // Get the overall range across all timeframes for this instrument
+            let overallMin = Infinity;
+            let overallMax = 0;
+            for (const db of matchingDbs) {
+              marketDataTimeframes.push(db.timeframe);
+              try {
+                const conn = getMarketDbSync(db.instrument, db.timeframe);
+                const range = conn.prepare("SELECT MIN(timestamp) as e, MAX(timestamp) as l FROM PriceBar").get() as { e: number; l: number };
+                if (range.e && range.e < overallMin) overallMin = range.e;
+                if (range.l && range.l > overallMax) overallMax = range.l;
+              } catch { /* skip */ }
+            }
+            if (overallMin !== Infinity) {
+              marketDataRange = { earliest: overallMin, latest: overallMax };
+              // Check if the data covers the signal's evaluation window
+              const signalStart = new Date(g.earliestSignal!).getTime();
+              const signalEnd = new Date(g.latestSignal!).getTime() + 48 * 3600000;
+              if (overallMin <= signalStart && overallMax >= signalEnd) {
+                marketDataStatus = "available";
+              } else {
+                marketDataStatus = "partial";
+              }
+            }
+          }
+
+          return {
+            instrument: g.instrument,
+            count: g.count,
+            channels: Array.from(g.channels),
+            earliestSignal: g.earliestSignal,
+            latestSignal: g.latestSignal,
+            signalIds: g.signalIds,
+            marketDataStatus,
+            marketDataRange: marketDataRange ? {
+              earliest: new Date(marketDataRange.earliest).toISOString(),
+              latest: new Date(marketDataRange.latest).toISOString(),
+            } : null,
+            marketDataTimeframes,
+          };
+        });
+
+        // Sort by count descending (most no_data signals first)
+        instruments.sort((a, b) => b.count - a.count);
+
+        return json(res, 200, {
+          total: signals.length,
+          affectedInstruments: instruments.length,
+          affectedChannels: new Set(signals.map(s => s.channelName)).size,
+          instruments,
+        });
+      } catch (e) {
+        return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     // ── Browse price bars (paginated, filtered) ─────────────────────────────
     // Query params: instrument, source, timeframe, from (ISO date), to (ISO date),
     //               page (1-based), pageSize (max 500)
