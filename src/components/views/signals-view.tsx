@@ -158,6 +158,60 @@ export function SignalsView() {
     Boolean
   ).length
 
+  // Reusable pagination bar — placed both above and below the table
+  const PaginationBar = () => (
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/70 bg-card px-3 py-2.5 text-xs text-muted-foreground">
+      <span>
+        {isFetching ? 'Loading…' : `${data ? (data.page - 1) * data.pageSize + 1 : 0}–${data ? Math.min(data.page * data.pageSize, data.total) : 0} of ${fmtCompact(data?.total ?? 0)} signals`}
+      </span>
+      <div className="flex items-center gap-1.5">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!data || data.page <= 1}
+          onClick={() => setFilter('page', 1)}
+          className="h-7 w-7 p-0"
+          title="First page"
+        >
+          <ChevronsLeft className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!data || data.page <= 1}
+          onClick={() => setFilter('page', (useUI.getState().filters.page) - 1)}
+          className="h-7 w-7 p-0"
+          title="Previous page"
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </Button>
+        <span className="tnum">
+          {data?.page ?? 1} / {data?.totalPages ?? 1}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!data || data.page >= (data?.totalPages ?? 1)}
+          onClick={() => setFilter('page', (useUI.getState().filters.page) + 1)}
+          className="h-7 w-7 p-0"
+          title="Next page"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!data || data.page >= (data?.totalPages ?? 1)}
+          onClick={() => setFilter('page', data?.totalPages ?? 1)}
+          className="h-7 w-7 p-0"
+          title="Last page"
+        >
+          <ChevronsRight className="h-4 w-4" />
+        </Button>
+      </div>
+    </div>
+  )
+
   return (
     <div className="space-y-4">
       {/* Filter bar */}
@@ -260,6 +314,9 @@ export function SignalsView() {
           </div>
         )}
       </div>
+
+      {/* Top pagination bar */}
+      <PaginationBar />
 
       {/* Table */}
       <div className="overflow-hidden rounded-xl border border-border/70 bg-card">
@@ -381,59 +438,10 @@ export function SignalsView() {
             </tbody>
           </table>
         </div>
-
-        {/* Pagination */}
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 px-3 py-2.5 text-xs text-muted-foreground">
-          <span>
-            {isFetching ? 'Loading…' : `${data ? (data.page - 1) * data.pageSize + 1 : 0}–${data ? Math.min(data.page * data.pageSize, data.total) : 0} of ${fmtCompact(data?.total ?? 0)} signals`}
-          </span>
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!data || data.page <= 1}
-              onClick={() => setFilter('page', 1)}
-              className="h-7 w-7 p-0"
-              title="First page"
-            >
-              <ChevronsLeft className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!data || data.page <= 1}
-              onClick={() => setFilter('page', (useUI.getState().filters.page) - 1)}
-              className="h-7 w-7 p-0"
-              title="Previous page"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </Button>
-            <span className="tnum">
-              {data?.page ?? 1} / {data?.totalPages ?? 1}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!data || data.page >= (data?.totalPages ?? 1)}
-              onClick={() => setFilter('page', (useUI.getState().filters.page) + 1)}
-              className="h-7 w-7 p-0"
-              title="Next page"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!data || data.page >= (data?.totalPages ?? 1)}
-              onClick={() => setFilter('page', data?.totalPages ?? 1)}
-              className="h-7 w-7 p-0"
-              title="Last page"
-            >
-              <ChevronsRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
       </div>
+
+      {/* Bottom pagination bar */}
+      <PaginationBar />
     </div>
   )
 }
