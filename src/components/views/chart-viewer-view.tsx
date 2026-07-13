@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   createChart,
   CandlestickSeries,
+  LineSeries,
   LineStyle,
   type IChartApi,
   type Time,
@@ -332,6 +333,29 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
       }))
     candleSeries.setData(candleData)
 
+    // Vertical line at the signal's posted time
+    // Use a LineSeries with a single vertical segment to mark when the
+    // signal was posted. The line spans from the lowest to highest price
+    // at the postedAt timestamp.
+    const postedTime = Math.floor(new Date(data.message.postedAt).getTime() / 1000) as Time
+    const allHighs = bars.map(b => b.high)
+    const allLows = bars.map(b => b.low)
+    const chartMax = Math.max(...allHighs, data.entryPrice, data.stopLoss, ...tps)
+    const chartMin = Math.min(...allLows, data.entryPrice, data.stopLoss, ...tps)
+
+    const vLineSeries = chart.addSeries(LineSeries, {
+      color: 'rgba(168, 85, 247, 0.6)',
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+    vLineSeries.setData([
+      { time: postedTime, value: chartMin },
+      { time: postedTime, value: chartMax },
+    ])
+
     // Price lines
     candleSeries.createPriceLine({
       price: data.entryPrice, color: '#3b82f6', lineWidth: 2,
@@ -465,6 +489,7 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
                 <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-blue-500" /> Entry</span>
                 <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-rose-500" /> SL</span>
                 <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-emerald-500" /> TP</span>
+                <span className="flex items-center gap-1"><span className="h-2 w-2 rounded bg-purple-500" /> Signal Posted</span>
                 {eval_?.exitPrice != null && (
                   <span className="flex items-center gap-1">
                     <span className="h-2 w-2 rounded-full" style={{ background: eval_.outcome === 'win' ? '#10b981' : eval_.outcome === 'loss' ? '#ef4444' : '#f59e0b' }} />
