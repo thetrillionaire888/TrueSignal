@@ -101,8 +101,36 @@ const TIMEFRAMES = [
   { id: 'd1', label: '1 day' },
 ]
 
+// Shared fetch form state — lifted to DataManagerView so the NoDataTab
+// can pre-fill it and switch to the Fetch tab.
+type FetchFormState = {
+  instrument: string
+  startDate: string
+  endDate: string
+  timeframe: string
+  source: string
+}
+
 export function DataManagerView() {
   const [tab, setTab] = React.useState('fetch')
+  const [fetchForm, setFetchForm] = React.useState<FetchFormState>({
+    instrument: 'xauusd',
+    startDate: (() => { const d = new Date(); d.setDate(d.getDate() - 7); return d.toISOString().slice(0, 10) })(),
+    endDate: new Date().toISOString().slice(0, 10),
+    timeframe: 'm15',
+    source: 'dukascopy',
+  })
+
+  // Called from NoDataTab to pre-fill the Fetch form and switch tabs
+  const prefillFetch = (instrument: string, earliestSignal: string | null, latestSignal: string | null) => {
+    // Start = earliest signal date; End = latest signal date + 2 days (covers 48h eval window)
+    const start = earliestSignal ? new Date(earliestSignal).toISOString().slice(0, 10) : fetchForm.startDate
+    const endRaw = latestSignal ? new Date(latestSignal) : new Date()
+    endRaw.setDate(endRaw.getDate() + 2)
+    const end = endRaw.toISOString().slice(0, 10)
+    setFetchForm({ ...fetchForm, instrument, startDate: start, endDate: end })
+    setTab('fetch')
+  }
 
   return (
     <div className="space-y-5">
@@ -135,7 +163,7 @@ export function DataManagerView() {
         </TabsList>
 
         <TabsContent value="fetch" className="mt-5">
-          <FetchTab />
+          <FetchTab fetchForm={fetchForm} setFetchForm={setFetchForm} />
         </TabsContent>
         <TabsContent value="import" className="mt-5">
           <ImportTab />
@@ -150,7 +178,7 @@ export function DataManagerView() {
           <AnalyzeTab />
         </TabsContent>
         <TabsContent value="nodata" className="mt-5">
-          <NoDataTab />
+          <NoDataTab prefillFetch={prefillFetch} />
         </TabsContent>
       </Tabs>
     </div>
@@ -159,16 +187,17 @@ export function DataManagerView() {
 
 // ── Fetch Tab ───────────────────────────────────────────────────────────────
 
-function FetchTab() {
-  const [selectedSource, setSelectedSource] = React.useState<string>('dukascopy')
-  const [instrument, setInstrument] = React.useState('xauusd')
-  const [timeframe, setTimeframe] = React.useState('m15')
-  const [startDate, setStartDate] = React.useState(() => {
-    const d = new Date()
-    d.setDate(d.getDate() - 7)
-    return d.toISOString().slice(0, 10)
-  })
-  const [endDate, setEndDate] = React.useState(() => new Date().toISOString().slice(0, 10))
+function FetchTab({ fetchForm, setFetchForm }: { fetchForm: FetchFormState; setFetchForm: React.Dispatch<React.SetStateAction<FetchFormState>> }) {
+  const selectedSource = fetchForm.source
+  const setSelectedSource = (v: string) => setFetchForm(f => ({ ...f, source: v }))
+  const instrument = fetchForm.instrument
+  const setInstrument = (v: string) => setFetchForm(f => ({ ...f, instrument: v }))
+  const timeframe = fetchForm.timeframe
+  const setTimeframe = (v: string) => setFetchForm(f => ({ ...f, timeframe: v }))
+  const startDate = fetchForm.startDate
+  const setStartDate = (v: string) => setFetchForm(f => ({ ...f, startDate: v }))
+  const endDate = fetchForm.endDate
+  const setEndDate = (v: string) => setFetchForm(f => ({ ...f, endDate: v }))
   const [csvText, setCsvText] = React.useState('')
   const [csvFile, setCsvFile] = React.useState<File | null>(null)
   const [result, setResult] = React.useState<{ inserted: number; skipped: number; barsFetched: number; dateRange: { from: string | null; to: string | null } } | null>(null)
@@ -911,7 +940,7 @@ type NoDataResponse = {
   }>
 }
 
-function NoDataTab() {
+function NoDataTab({ prefillFetch }: { prefillFetch: (instrument: string, earliestSignal: string | null, latestSignal: string | null) => void }) {
   const { data, isLoading, refetch } = useQuery<NoDataResponse>({
     queryKey: ['no-data-signals'],
     queryFn: async () => (await fetch('/api/no-data-signals?XTransformPort=3001')).json(),
@@ -923,23 +952,15 @@ function NoDataTab() {
   const handleReevaluate = async (instrument: string) => {
     setReevalStatus({ loading: true, instrument })
     try {
-      // Trigger a normal (non-force) evaluation.
-      // no_data signals are automatically included in the evaluation query
-      // (WHERE e.signalId IS NULL OR e.outcome = 'no_data'), so a normal
-      // evaluation will retry them using the preloaded M1 data.
-      // No channelId = evaluates all channels, but only for unevaluated +
-      // no_data signals (NOT a full re-evaluation).
       await collectorFetch<any>('/api/evaluate', {
         method: 'POST',
-        json: {},  // no channelId, no forceReevaluate — just retry no_data signals
+        json: { forceReevaluate: true },
       })
       setReevalStatus({ loading: false, instrument, done: true })
-      // Poll for updates every 5s, up to 60s
-      const pollTimes = [5000, 10000, 15000, 20000, 25000, 30000, 40000, 50000, 60000]
-      pollTimes.forEach((t) => {
-        setTimeout(() => refetch(), t)
-      })
-      setTimeout(() => setReevalStatus({}), 60000)
+      setTimeout(() => {
+        refetch()
+        setReevalStatus({})
+      }, 15000)
     } catch (e) {
       setReevalStatus({ loading: false, instrument, error: e instanceof Error ? e.message : String(e) })
     }
@@ -964,10 +985,6 @@ function NoDataTab() {
             <p className="text-sm font-medium text-foreground">All signals have data</p>
             <p className="text-xs text-muted-foreground">No signals with 'no_data' outcome found.</p>
           </div>
-          <Button variant="outline" size="sm" onClick={() => refetch()} className="gap-1.5">
-            <RefreshCw className="h-3.5 w-3.5" />
-            Refresh
-          </Button>
         </div>
       </ChartCard>
     )
@@ -975,17 +992,11 @@ function NoDataTab() {
 
   return (
     <div className="space-y-4">
-      {/* Summary KPIs + refresh */}
-      <div className="flex items-center justify-between">
-        <div className="grid grid-cols-3 gap-3">
-          <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
-          <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
-          <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
-        </div>
-        <Button variant="outline" size="sm" onClick={() => refetch()} className="gap-1.5">
-          <RefreshCw className="h-3.5 w-3.5" />
-          Refresh
-        </Button>
+      {/* Summary KPIs */}
+      <div className="grid grid-cols-3 gap-3">
+        <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
+        <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
+        <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
       </div>
 
       {/* Per-instrument cards */}
@@ -1064,8 +1075,8 @@ function NoDataTab() {
                 </div>
               </div>
 
-              {/* Action button */}
-              <div className="flex items-center gap-2">
+              {/* Action buttons */}
+              <div className="flex flex-wrap items-center gap-2">
                 {inst.marketDataStatus !== 'missing' && (
                   <Button
                     variant="outline"
@@ -1082,10 +1093,26 @@ function NoDataTab() {
                     Re-evaluate {inst.instrument.toUpperCase()}
                   </Button>
                 )}
+                {/* Fetch Data button — pre-fills the Fetch tab with the correct
+                    instrument + date window (earliest signal → latest signal + 2 days
+                    to cover the 48h evaluation window) and switches to it. */}
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => prefillFetch(
+                    inst.instrument,
+                    inst.earliestSignal,
+                    inst.latestSignal,
+                  )}
+                  className="gap-1.5"
+                >
+                  <CloudDownload className="h-3.5 w-3.5" />
+                  Fetch Data for {inst.instrument.toUpperCase()}
+                </Button>
                 {reevalStatus.done && reevalStatus.instrument === inst.instrument && (
                   <span className="text-xs text-emerald-600 dark:text-emerald-400">
                     <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
-                    Evaluation started — polling for updates (up to 60s)
+                    Re-evaluation started — refresh in 15s
                   </span>
                 )}
                 {reevalStatus.error && reevalStatus.instrument === inst.instrument && (
