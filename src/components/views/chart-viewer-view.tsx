@@ -60,7 +60,10 @@ type SignalDetail = {
     exitReason: string | null
     hitTpLevel: number | null
     rMultiple: number
+    pnlPercent: number
     durationMinutes: number | null
+    maxFavorablePct: number | null
+    maxAdversePct: number | null
     marketDataSource: string
   } | null
 }
@@ -413,59 +416,93 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
   return (
     <div className="space-y-3">
       {/* Signal info bar */}
-      <div className="flex flex-wrap items-center gap-4 rounded-xl border border-border/70 bg-card p-4">
-        <div className="flex items-center gap-2">
-          <ChannelAvatar name={data.channel.name} color={data.channel.avatarColor} size="sm" />
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="text-lg font-bold">{data.instrument}</span>
-              <ActionBadge action={data.action} />
-              {eval_ && <OutcomeBadge outcome={eval_.outcome} />}
+      <div className="rounded-xl border border-border/70 bg-card p-4">
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <ChannelAvatar name={data.channel.name} color={data.channel.avatarColor} size="sm" />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-lg font-bold">{data.instrument}</span>
+                <ActionBadge action={data.action} />
+                {eval_ && <OutcomeBadge outcome={eval_.outcome} />}
+              </div>
+              <div className="text-xs text-muted-foreground">{data.channel.name}</div>
             </div>
-            <div className="text-xs text-muted-foreground">{data.channel.name}</div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-4 text-xs">
+            <div>
+              <span className="text-muted-foreground">Entry: </span>
+              <span className="font-semibold tnum">
+                {data.isRange && data.entryLow != null && data.entryHigh != null
+                  ? `${fmtPrice(data.entryLow)} – ${fmtPrice(data.entryHigh)}`
+                  : fmtPrice(data.entryPrice)}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">SL: </span>
+              <span className="font-semibold tnum text-rose-500">{fmtPrice(data.stopLoss)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">TPs: </span>
+              <span className="font-semibold tnum text-emerald-500">
+                {tps.map(fmtPrice).join(', ')}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Posted: </span>
+              <span className="font-semibold">{fmtDateTime(data.message.postedAt)}</span>
+            </div>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4 text-xs">
-          <div>
-            <span className="text-muted-foreground">Entry: </span>
-            <span className="font-semibold tnum">
-              {data.isRange && data.entryLow != null && data.entryHigh != null
-                ? `${fmtPrice(data.entryLow)} – ${fmtPrice(data.entryHigh)}`
-                : fmtPrice(data.entryPrice)}
-            </span>
-          </div>
-          <div>
-            <span className="text-muted-foreground">SL: </span>
-            <span className="font-semibold tnum text-rose-500">{fmtPrice(data.stopLoss)}</span>
-          </div>
-          <div>
-            <span className="text-muted-foreground">TPs: </span>
-            <span className="font-semibold tnum text-emerald-500">
-              {tps.map(fmtPrice).join(', ')}
-            </span>
-          </div>
-          {eval_ && (
-            <>
-              <div>
-                <span className="text-muted-foreground">R: </span>
-                <RMultiple value={eval_.rMultiple} />
+        {/* Evaluation metrics row */}
+        {eval_ && (
+          <div className="mt-3 grid grid-cols-2 gap-2 border-t border-border/50 pt-3 text-xs sm:grid-cols-4 lg:grid-cols-8">
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">R-Multiple</div>
+              <div className="font-semibold"><RMultiple value={eval_.rMultiple} /></div>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Exit Price</div>
+              <div className="font-semibold tnum">{eval_.exitPrice != null ? fmtPrice(eval_.exitPrice) : '—'}</div>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Exit Reason</div>
+              <div className="font-semibold">{eval_.exitReason ?? '—'}</div>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">TP Hit</div>
+              <div className="font-semibold">{eval_.hitTpLevel ? `TP${eval_.hitTpLevel}` : '—'}</div>
+            </div>
+            <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Max Favorable</div>
+              <div className="font-semibold tnum text-emerald-600 dark:text-emerald-400">
+                {eval_.maxFavorablePct != null ? `+${eval_.maxFavorablePct.toFixed(1)}%` : '—'}
               </div>
-              <div>
-                <span className="text-muted-foreground">Exit: </span>
-                <span className="font-semibold">{eval_.exitReason ?? '—'}</span>
+            </div>
+            <div className="rounded-lg bg-rose-500/10 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Max Adverse</div>
+              <div className="font-semibold tnum text-rose-600 dark:text-rose-400">
+                {eval_.maxAdversePct != null ? `${eval_.maxAdversePct.toFixed(1)}%` : '—'}
               </div>
-              <div>
-                <span className="text-muted-foreground">TF: </span>
-                <span className="font-semibold">{eval_.marketDataSource.split('-').pop()?.toUpperCase()}</span>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Duration</div>
+              <div className="font-semibold tnum">
+                {eval_.durationMinutes != null
+                  ? eval_.durationMinutes < 60
+                    ? `${eval_.durationMinutes}m`
+                    : `${Math.floor(eval_.durationMinutes / 60)}h ${eval_.durationMinutes % 60}m`
+                  : '—'}
               </div>
-            </>
-          )}
-          <div>
-            <span className="text-muted-foreground">Posted: </span>
-            <span className="font-semibold">{fmtDateTime(data.message.postedAt)}</span>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
+              <div className="text-[10px] uppercase text-muted-foreground">Eval TF</div>
+              <div className="font-semibold">{eval_.marketDataSource.split('-').pop()?.toUpperCase()}</div>
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* Chart container */}
