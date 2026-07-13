@@ -158,7 +158,7 @@ export function DataManagerView() {
           </TabsTrigger>
           <TabsTrigger value="nodata" className="gap-1.5">
             <AlertCircle className="h-3.5 w-3.5" />
-            No Data
+            Missing Data
           </TabsTrigger>
         </TabsList>
 
@@ -921,7 +921,7 @@ function ImportTab() {
   )
 }
 
-// ── No Data Tab (Follow-up for no_data signals) ─────────────────────────────
+// ── Missing Data Tab (Follow-up for no_data signals) ───────────────────────
 
 type NoDataResponse = {
   total: number
@@ -968,7 +968,7 @@ function NoDataTab({ prefillFetch }: { prefillFetch: (instrument: string, earlie
 
   if (isLoading) {
     return (
-      <ChartCard title="No Data Signals" description="Loading...">
+      <ChartCard title="Missing Data" description="Loading...">
         <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" /> Loading no-data signals...
         </div>
@@ -978,7 +978,7 @@ function NoDataTab({ prefillFetch }: { prefillFetch: (instrument: string, earlie
 
   if (!data || data.total === 0) {
     return (
-      <ChartCard title="No Data Signals" description="Signals that failed evaluation due to missing market data">
+      <ChartCard title="Missing Data" description="Signals that failed evaluation due to missing market data">
         <div className="flex flex-col items-center gap-3 py-12 text-center">
           <CheckCircle2 className="h-10 w-10 text-emerald-500" />
           <div>
@@ -994,7 +994,7 @@ function NoDataTab({ prefillFetch }: { prefillFetch: (instrument: string, earlie
     <div className="space-y-4">
       {/* Summary KPIs */}
       <div className="grid grid-cols-3 gap-3">
-        <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
+        <KpiCard label="Missing Data" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
         <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
         <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
       </div>
