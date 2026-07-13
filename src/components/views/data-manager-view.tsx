@@ -1597,7 +1597,7 @@ function AnalyzeTab() {
               {data.groups
                 .sort((a, b) => b.count - a.count)
                 .map((g) => (
-                  <tr key={`${g.source}-${g.instrument}`} className="border-b border-border/40 hover:bg-muted/30">
+                  <tr key={`${g.source}-${g.instrument}-${g.count}-${g.earliest}`} className="border-b border-border/40 hover:bg-muted/30">
                     <td className="px-3 py-2">
                       <span className={cn(
                         'rounded px-1.5 py-0.5 text-[10px] font-medium capitalize',
