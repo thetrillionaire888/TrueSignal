@@ -65,14 +65,24 @@ type SignalDetail = {
 }
 
 export function ChartViewerView() {
+  const { filters, setFilter } = useUI()
+  const channelId = filters.channelId
   const [selectedSignalId, setSelectedSignalId] = React.useState<string | null>(null)
   const [signalIndex, setSignalIndex] = React.useState(0)
 
-  // Fetch the list of all signals for navigation
+  // Fetch the list of channels for the scope selector
+  const channelsQuery = useQuery<{ channels: Array<{ id: string; name: string }> }>({
+    queryKey: ['channels-list'],
+    queryFn: async () => (await fetch('/api/channels')).json(),
+    staleTime: 120_000,
+  })
+
+  // Fetch the list of signals for navigation (filtered by channel scope)
   const signalsListQuery = useQuery<{ signals: SignalSummary[]; total: number }>({
-    queryKey: ['signals-list-chart'],
+    queryKey: ['signals-list-chart', channelId ?? 'all'],
     queryFn: async () => {
       const params = new URLSearchParams({ page: '1', pageSize: '100', sort: 'postedAt', sortDir: 'desc' })
+      if (channelId) params.set('channelId', channelId)
       return (await fetch(`/api/signals?${params}`)).json()
     },
     staleTime: 60_000,
@@ -80,13 +90,15 @@ export function ChartViewerView() {
 
   const signals = signalsListQuery.data?.signals ?? []
 
-  // Auto-select the first signal when data loads
+  // Reset selection when scope changes or when signals load
   React.useEffect(() => {
-    if (!selectedSignalId && signals.length > 0) {
+    if (signals.length > 0) {
       setSelectedSignalId(signals[0].id)
       setSignalIndex(0)
+    } else {
+      setSelectedSignalId(null)
     }
-  }, [signals, selectedSignalId])
+  }, [channelId])  // only reset on scope change, not on every signals update
 
   // Fetch the selected signal's detail
   const detailQuery = useQuery<SignalDetail>({
@@ -138,8 +150,28 @@ export function ChartViewerView() {
 
   return (
     <div className="space-y-4">
-      {/* Navigation bar */}
+      {/* Scope selector + navigation bar */}
       <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border/70 bg-card p-3">
+        <span className="text-xs font-medium text-muted-foreground">Scope</span>
+        <Select
+          value={channelId ?? 'all'}
+          onValueChange={(v) => setFilter('channelId', v === 'all' ? null : v)}
+        >
+          <SelectTrigger className="h-9 w-48 text-xs">
+            <SelectValue placeholder="All channels" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All channels</SelectItem>
+            {channelsQuery.data?.channels.map((c) => (
+              <SelectItem key={c.id} value={c.id}>
+                {c.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <div className="mx-2 h-6 w-px bg-border/50" />
+
         <Select
           value={selectedSignalId ?? ''}
           onValueChange={(id) => {
