@@ -531,14 +531,17 @@ function CandlestickChart({
       wickDownColor: '#ef4444',
     })
 
-    // Set candlestick data (lightweight-charts expects time in seconds)
-    const candleData = bars.map(b => ({
-      time: Math.floor(b.timestamp / 1000) as Time,
-      open: b.open,
-      high: b.high,
-      low: b.low,
-      close: b.close,
-    }))
+    // Set candlestick data (lightweight-charts expects time in seconds, ASC ordered)
+    const candleData = bars
+      .slice()
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map(b => ({
+        time: Math.floor(b.timestamp / 1000) as Time,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+      }))
     candleSeries.setData(candleData)
 
     // Add price lines for entry, SL, TPs, exit
