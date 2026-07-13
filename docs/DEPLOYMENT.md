@@ -169,6 +169,10 @@ Next.js rewrites are already configured in `next.config.ts` — no changes neede
 
 **Note**: For large CSV uploads (400MB+), Caddy is recommended. The Next.js rewrite proxy buffers the entire request body, which can cause `ERR_CONNECTION_RESET` on very large uploads. If you encounter this, either use Caddy or use the chunked upload endpoint (`/api/import-csv-chunk`) which splits files into 5MB pieces.
 
+## Frontend charting dependency
+
+The Chart Viewer uses [TradingView Lightweight Charts](https://github.com/tradingview/lightweight-charts) (v5.2.0) for professional candlestick visualization. This is installed automatically via `bun install` — no extra setup needed.
+
 ## Manual startup (3 terminals)
 
 ```bash

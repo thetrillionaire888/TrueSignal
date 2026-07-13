@@ -36,8 +36,13 @@ TrueSignal is for **educational purposes only**. It does not provide financial a
 - **Chunked CSV import** — handles 400MB+ CSV files via 5MB chunked upload with live progress (no OOM, no connection resets)
 - **Flexible CSV parser** — auto-detects StrategyQuant, ISO 8601, Unix epoch, and Bid/Ask formats with automatic timeframe detection and aggregation
 - **Parallel evaluation** — 8-worker concurrent evaluation with batched transactional writes
-- **Analytics dashboard** — equity curves, win/loss donuts, R-multiple distributions, monthly heatmaps, MFE-vs-MAE scatter, per-trade Sharpe/Sortino/Calmar ratios
-- **Sortable signals table** — click any column header to sort ascending/descending (server-side SQL ORDER BY)
+- **Analytics dashboard** — equity curves, win/loss donuts, R-multiple distributions, monthly heatmaps (uses `postedAt`), MFE-vs-MAE scatter, per-trade Sharpe/Sortino/Calmar ratios
+- **Chart Viewer** — full-page TradingView Lightweight Charts (v5.2.0) candlestick view with entry/SL/TP/exit price-line overlays, vertical signal-posted marker, 12h pre-context + 48h eval window, Prev/Next + keyboard navigation, channel scope selector, merged Parsed Signal + Evaluation metrics info bar
+- **Multi-TP evaluation** — two-phase model: SL at original stop until TP1, then SL moves to breakeven; tracks highest TP reached; R = (highest_tp - entry) / risk
+- **Sortable signals table** — click any column header to sort ascending/descending (server-side SQL ORDER BY), with top + bottom pagination bars and Invalid/No data outcome filters
+- **Validation coverage** — progress bars in Channel Cards, Channel Drawer, and Analytics showing evaluated/total signals percentage
+- **Missing Data tab** — Data Manager tab collecting all `no_data` signals grouped by instrument, with market data availability check and Fetch Data + Re-evaluate buttons
+- **Force re-evaluation** — Channel Drawer Re-evaluate button re-evaluates ALL signals for that channel (not just no_data)
 - **No-data retry** — signals with `no_data` outcome are automatically retried on subsequent batch evaluations
 - **Pause/Resume/Stop** — full control over ingestion with resume-from-position support
 - **Signal deduplication** — prevents duplicate signals via `channelId + postedAt` unique constraint
@@ -109,8 +114,8 @@ bash scripts/stop-dev.sh --force      # Also kill any process on ports 3000/3001
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/ARCHITECTURE.md) | Service architecture, per-asset database design, data flow, technology stack |
-| [Usage Guide](docs/USAGE.md) | How to authenticate, ingest, evaluate, import, fetch, export, and view analytics |
-| [API Reference](docs/API.md) | Collector HTTP endpoints and Socket.IO events |
+| [Usage Guide](docs/USAGE.md) | How to authenticate, ingest, evaluate, import, fetch, export, view analytics, and use Chart Viewer + Missing Data tab |
+| [API Reference](docs/API.md) | Collector HTTP endpoints, Socket.IO events, multi-TP evaluation, forceReevaluate |
 | [Deployment Guide](docs/DEPLOYMENT.md) | Dev launcher, Caddy setup, production build, PM2/systemd, HTTPS/TLS |
 
 ---
@@ -125,7 +130,7 @@ src/
 │   └── page.tsx                # Main page (view router + drawers)
 ├── components/
 │   ├── charts/                 # Recharts components (equity, donut, distribution, heatmap, scatter)
-│   ├── views/                  # Main views (overview, channels, signals, analytics, ingest, pipeline, data-manager, export)
+│   ├── views/                  # Main views (overview, channels, signals, analytics, chart-viewer, ingest, pipeline, data-manager, export)
 │   ├── app-sidebar.tsx         # Navigation sidebar + auth status card
 │   ├── signal-detail-drawer.tsx
 │   └── channel-detail-drawer.tsx

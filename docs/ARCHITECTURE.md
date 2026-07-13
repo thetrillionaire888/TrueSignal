@@ -31,10 +31,10 @@ TrueSignal uses a two-service architecture with a per-asset SQLite database back
 
 The user-facing web application built with Next.js 16 (App Router). Provides:
 
-- **Dashboard views** — Overview, Channels, Signals (sortable), Analytics, Pipeline
+- **Dashboard views** — Overview, Channels, Signals (sortable, top+bottom pagination, Invalid/No data filters), Analytics, Chart Viewer (TradingView LWC), Pipeline
 - **Ingest view** — Telegram authentication, channel resolution, ingestion with pause/resume/stop
-- **Data Manager** — 5 tabs: Fetch, Import (CSV upload), Browse, Export, Analyze
-- **API routes** — `/api/overview`, `/api/channels`, `/api/signals`, `/api/analytics`, `/api/export`, `/api/pipeline`, `/api/import-csv-stream`
+- **Data Manager** — 6 tabs: Fetch, Import (CSV upload), Browse, Export, Analyze, Missing Data (no_data follow-up)
+- **API routes** — `/api/overview`, `/api/channels`, `/api/signals`, `/api/analytics`, `/api/export`, `/api/pipeline`, `/api/import-csv-stream`, `/api/no-data-signals`
 - **Sidebar auth status** — Telegram auth state visible on all views
 
 ### 2. Telegram Collector (port 3001)
@@ -222,7 +222,7 @@ Telegram → Collector (MTProto) → Message table (audit.db) → Parser → Sig
 | Database | SQLite (2 ATTACH'd + per-asset market DBs, Drizzle ORM) |
 | DB Driver | bun:sqlite (Bun) / better-sqlite3 (Node.js) — runtime-aware |
 | State | Zustand (client) + TanStack Query (server) |
-| Charts | Recharts |
+| Charts | Recharts + TradingView Lightweight Charts v5.2.0 |
 | Telegram | teleproto (MTProto client) |
 | Market data | dukascopy-node, Binance REST API, Binance Vision archive, Yahoo Finance API |
 | Real-time | Socket.IO |

@@ -32,6 +32,15 @@ Authentication status is visible in the **sidebar footer** on all views.
    - **Limit orders**: fill when price touches entry (pullback trigger)
    - **Range orders**: fill when price touches range (conservative fill at edge closest to SL)
 5. Results appear in the **Signals** and **Overview** views
+
+### Multi-TP evaluation
+
+For signals with multiple take-profit targets, the evaluator uses a two-phase model:
+
+- **Phase 1 (pre-TP1)**: SL stays at original stop loss. If SL hit before TP1, outcome = loss (R = -1).
+- **Phase 2 (post-TP1)**: SL moves to breakeven (entry price). Tracks the highest TP reached. If price reverses to breakeven, outcome = breakeven (R = 0). At end of window, outcome = win with R = (highest_tp - entry) / risk.
+
+The `hitTpLevel` field records the highest TP reached (1-8). Single-TP signals are unaffected.
 6. The `marketDataSource` field in each evaluation records which source+timeframe was used (e.g. `dukascopy-m1`)
 
 ### Re-evaluating signals
@@ -109,9 +118,10 @@ If a source fails (timeout, rate limit, error), the next source is tried automat
 | **Overview** | Equity curve (continuous daily range, uses postedAt), KPIs (win rate, expectancy, per-trade Sharpe/Sortino/Calmar, max DD), channel leaderboard, drawdown |
 | **Channels** | Per-channel performance cards, sortable by Total R / Win Rate / Expectancy / Sharpe / Subscribers |
 | **Signals** | Sortable table (click any column header to sort asc/desc) with filters (channel, instrument, action, outcome), debounced search, signal detail drawer with price ladder |
-| **Analytics** | R-multiple distribution, monthly heatmap, MFE-vs-MAE scatter, instrument breakdown, long vs short (win rate excludes breakevens) |
+| **Analytics** | R-multiple distribution, monthly heatmap (uses postedAt), MFE-vs-MAE scatter, instrument breakdown, validation coverage bar, long vs short (win rate excludes breakevens) |
+| **Chart Viewer** | Full-page TradingView candlestick chart with entry/SL/TP/exit overlays, vertical signal-posted marker, Prev/Next + keyboard navigation, channel scope, merged metrics info bar |
 | **Pipeline** | Ingestion architecture visualization, per-channel ingestion counts, live feed |
-| **Data Manager** | 5 tabs: Fetch (API sources), Import (CSV upload), Browse (paginated data viewer), Export (bars download), Analyze (cache summary + charts) |
+| **Data Manager** | 6 tabs: Fetch (API sources), Import (CSV upload), Browse (paginated data viewer), Export (bars download), Analyze (cache summary + charts), Missing Data (no_data follow-up) |
 
 ### Sortable signals table
 
@@ -134,6 +144,38 @@ Click any signal row to open the detail drawer. The **Parsed Signal** section sh
 ### First/last page navigation
 
 All paginated tables include first page (`|<`) and last page (`>|`) buttons alongside the prev/next buttons, allowing quick navigation to the start or end of large datasets.
+
+## Chart Viewer
+
+The Chart Viewer is a dedicated full-page view for visual signal inspection:
+
+1. Go to **Chart Viewer** in the sidebar
+2. Select a channel scope (or "All channels")
+3. Navigate signals using:
+   - **Dropdown** to jump to any signal
+   - **Prev/Next buttons** to cycle sequentially
+   - **Keyboard arrows** (left/right) for quick navigation
+4. The chart shows:
+   - **Candlesticks** (TradingView Lightweight Charts) for 12h before + 48h after the signal
+   - **Vertical purple line** marking when the signal was posted
+   - **Blue line**: Entry price (dashed for range bounds)
+   - **Red dashed line**: Stop Loss
+   - **Green dashed lines**: Each Take Profit (TP1, TP2, ...)
+   - **Colored line**: Exit price (green=win, red=loss, amber=other)
+5. The info bar shows all Parsed Signal + Evaluation metrics (8 cards)
+
+## Missing Data tab (Data Manager)
+
+The Missing Data tab collects all signals with `no_data` outcome for follow-up:
+
+1. Go to **Data Manager** > **Missing Data** tab
+2. See which instruments have no_data signals (sorted by count)
+3. Check market data status:
+   - Green: data available and covers the signal window
+   - Amber: data partial (doesn't fully cover the window)
+   - Red: no market data found
+4. Click **Fetch Data** to pre-fill the Fetch tab with the correct instrument + date window
+5. Click **Re-evaluate** to retry the no_data signals
 
 ## Multi-stage signal parsing
 

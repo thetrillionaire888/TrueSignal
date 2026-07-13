@@ -57,7 +57,7 @@ Accepts `@username`, channel title, or numeric Peer ID (e.g. `2166348331` or `-1
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/evaluate` | POST | Evaluate unevaluated + `no_data` signals (`{ channelId? }`) |
+| `/api/evaluate` | POST | Evaluate unevaluated + `no_data` signals (`{ channelId?, forceReevaluate? }`) |
 | `/api/evaluate-signal` | POST | Re-evaluate a single signal by ID (`{ signalId }`) — uses forceRefresh |
 | `/api/eval-stats` | GET | Get evaluation counts (total/evaluated/pending) |
 
@@ -151,6 +151,7 @@ Chunked upload endpoint for very large CSV files. The frontend splits the file i
 | `/api/import` | POST | Fetch price bars from Dukascopy/Binance/Yahoo/CSV (legacy) |
 | `/api/browse-bars` | GET | Browse cached price bars (paginated, filtered by instrument/source/timeframe/date) |
 | `/api/cache-summary` | GET | Get PriceBar cache summary (aggregated across all per-asset DBs) |
+| `/api/no-data-signals` | GET | Get all no_data signals grouped by instrument with market data availability |
 | `/api/export-bars` | GET | Export cached price bars as CSV/JSON |
 
 ### Multi-source data fetching priority
