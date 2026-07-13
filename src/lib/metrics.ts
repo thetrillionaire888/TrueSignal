@@ -285,7 +285,7 @@ export function monthlyPerformance(rows: EvalRow[]) {
   const closed = rows.filter((r) => r.outcome !== 'pending')
   const map = new Map<string, { r: number; pnl: number; trades: number; wins: number }>()
   for (const r of closed) {
-    const key = r.evaluatedAt.toISOString().slice(0, 7) // yyyy-mm
+    const key = r.postedAt.toISOString().slice(0, 7) // yyyy-mm (based on signal date, not eval date)
     const e = map.get(key) ?? { r: 0, pnl: 0, trades: 0, wins: 0 }
     e.r += r.rMultiple
     e.pnl += r.pnlPercent
