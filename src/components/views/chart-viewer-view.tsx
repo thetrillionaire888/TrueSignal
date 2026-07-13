@@ -51,6 +51,7 @@ type SignalDetail = {
   stopLoss: number
   takeProfits: string
   leverage: string | null
+  positionSize: string | null
   timeframe: string | null
   channel: { id: string; name: string; avatarColor: string; category: string }
   message: { postedAt: string }
@@ -415,14 +416,16 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
 
   return (
     <div className="space-y-3">
-      {/* Signal info bar */}
+      {/* Signal info bar — merged Parsed Signal + Evaluation metrics */}
       <div className="rounded-xl border border-border/70 bg-card p-4">
+        {/* Row 1: Identity + signal basics */}
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
             <ChannelAvatar name={data.channel.name} color={data.channel.avatarColor} size="sm" />
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-lg font-bold">{data.instrument}</span>
+                <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground capitalize">{data.instrumentType}</span>
                 <ActionBadge action={data.action} />
                 {eval_ && <OutcomeBadge outcome={eval_.outcome} />}
               </div>
@@ -449,6 +452,24 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
                 {tps.map(fmtPrice).join(', ')}
               </span>
             </div>
+            {data.timeframe && (
+              <div>
+                <span className="text-muted-foreground">Signal TF: </span>
+                <span className="font-semibold">{data.timeframe}</span>
+              </div>
+            )}
+            {data.leverage && (
+              <div>
+                <span className="text-muted-foreground">Leverage: </span>
+                <span className="font-semibold">{data.leverage}</span>
+              </div>
+            )}
+            {data.positionSize && (
+              <div>
+                <span className="text-muted-foreground">Position: </span>
+                <span className="font-semibold">{data.positionSize}</span>
+              </div>
+            )}
             <div>
               <span className="text-muted-foreground">Posted: </span>
               <span className="font-semibold">{fmtDateTime(data.message.postedAt)}</span>
@@ -456,7 +477,7 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
           </div>
         </div>
 
-        {/* Evaluation metrics row */}
+        {/* Row 2: Evaluation metrics grid */}
         {eval_ && (
           <div className="mt-3 grid grid-cols-2 gap-2 border-t border-border/50 pt-3 text-xs sm:grid-cols-4 lg:grid-cols-8">
             <div className="rounded-lg bg-muted/40 px-2.5 py-1.5">
