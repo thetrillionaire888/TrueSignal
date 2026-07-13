@@ -30,7 +30,7 @@ import {
   AlertCircle,
   Copy,
   Check,
-  CandlestickChart,
+  CandlestickChart as CandlestickChartIcon,
 } from 'lucide-react'
 
 type Detail = {
@@ -562,7 +562,7 @@ function CandlestickChart({
   return (
     <div className="mt-3 rounded-lg border border-border/50 bg-muted/10 p-3">
       <div className="mb-2 flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <CandlestickChart className="h-3.5 w-3.5" />
+        <CandlestickChartIcon className="h-3.5 w-3.5" />
         Price Movement ({displayBars.length} bars · {instrument.toUpperCase()})
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '220px' }}>
