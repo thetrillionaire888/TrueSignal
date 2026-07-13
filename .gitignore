@@ -8,3 +8,7 @@ db/*.db-wal
 mini-services/telegram-collector/session.str
 mini-services/telegram-collector/.env
 .env
+
+# Telegram session files - never commit (contains auth session data)
+session.str
+**/session.str
