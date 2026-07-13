@@ -72,9 +72,16 @@ export function ChannelDetailDrawer() {
     enabled: !!selectedChannelId && channelDetailOpen,
   })
 
-  // Reparse + re-evaluate state
+  // Reparse + re-evaluate state — reset when the selected channel changes
+  // to prevent status notifications from leaking between channels.
   const [reparseStatus, setReparseStatus] = React.useState<{ loading: boolean; result?: any; error?: string }>({})
   const [reevalStatus, setReevalStatus] = React.useState<{ loading: boolean; started?: boolean; error?: string }>({})
+
+  // Reset status whenever the selected channel changes
+  React.useEffect(() => {
+    setReparseStatus({})
+    setReevalStatus({})
+  }, [selectedChannelId])
 
   const handleReparse = async () => {
     if (!selectedChannelId) return
