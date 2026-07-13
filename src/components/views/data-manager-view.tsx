@@ -923,15 +923,23 @@ function NoDataTab() {
   const handleReevaluate = async (instrument: string) => {
     setReevalStatus({ loading: true, instrument })
     try {
+      // Trigger a normal (non-force) evaluation.
+      // no_data signals are automatically included in the evaluation query
+      // (WHERE e.signalId IS NULL OR e.outcome = 'no_data'), so a normal
+      // evaluation will retry them using the preloaded M1 data.
+      // No channelId = evaluates all channels, but only for unevaluated +
+      // no_data signals (NOT a full re-evaluation).
       await collectorFetch<any>('/api/evaluate', {
         method: 'POST',
-        json: { forceReevaluate: true },
+        json: {},  // no channelId, no forceReevaluate — just retry no_data signals
       })
       setReevalStatus({ loading: false, instrument, done: true })
-      setTimeout(() => {
-        refetch()
-        setReevalStatus({})
-      }, 15000)
+      // Poll for updates every 5s, up to 60s
+      const pollTimes = [5000, 10000, 15000, 20000, 25000, 30000, 40000, 50000, 60000]
+      pollTimes.forEach((t) => {
+        setTimeout(() => refetch(), t)
+      })
+      setTimeout(() => setReevalStatus({}), 60000)
     } catch (e) {
       setReevalStatus({ loading: false, instrument, error: e instanceof Error ? e.message : String(e) })
     }
@@ -956,6 +964,10 @@ function NoDataTab() {
             <p className="text-sm font-medium text-foreground">All signals have data</p>
             <p className="text-xs text-muted-foreground">No signals with 'no_data' outcome found.</p>
           </div>
+          <Button variant="outline" size="sm" onClick={() => refetch()} className="gap-1.5">
+            <RefreshCw className="h-3.5 w-3.5" />
+            Refresh
+          </Button>
         </div>
       </ChartCard>
     )
@@ -963,11 +975,17 @@ function NoDataTab() {
 
   return (
     <div className="space-y-4">
-      {/* Summary KPIs */}
-      <div className="grid grid-cols-3 gap-3">
-        <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
-        <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
-        <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
+      {/* Summary KPIs + refresh */}
+      <div className="flex items-center justify-between">
+        <div className="grid grid-cols-3 gap-3">
+          <KpiCard label="No Data Signals" value={fmtInt(data.total)} icon={AlertCircle} tone="negative" />
+          <KpiCard label="Affected Instruments" value={fmtInt(data.affectedInstruments)} icon={Database} tone="muted" />
+          <KpiCard label="Affected Channels" value={fmtInt(data.affectedChannels)} icon={TrendingUp} tone="muted" />
+        </div>
+        <Button variant="outline" size="sm" onClick={() => refetch()} className="gap-1.5">
+          <RefreshCw className="h-3.5 w-3.5" />
+          Refresh
+        </Button>
       </div>
 
       {/* Per-instrument cards */}
@@ -1067,7 +1085,7 @@ function NoDataTab() {
                 {reevalStatus.done && reevalStatus.instrument === inst.instrument && (
                   <span className="text-xs text-emerald-600 dark:text-emerald-400">
                     <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
-                    Re-evaluation started — refresh in 15s
+                    Evaluation started — polling for updates (up to 60s)
                   </span>
                 )}
                 {reevalStatus.error && reevalStatus.instrument === inst.instrument && (
