@@ -8,6 +8,7 @@ import { OverviewView } from '@/components/views/overview-view'
 import { ChannelsView } from '@/components/views/channels-view'
 import { SignalsView } from '@/components/views/signals-view'
 import { AnalyticsView } from '@/components/views/analytics-view'
+import { ChartViewerView } from '@/components/views/chart-viewer-view'
 import { IngestView } from '@/components/views/ingest-view'
 import { PipelineView } from '@/components/views/pipeline-view'
 import { DataManagerView } from '@/components/views/data-manager-view'
@@ -27,6 +28,8 @@ function ViewRouter() {
       return <SignalsView />
     case 'analytics':
       return <AnalyticsView />
+    case 'chart-viewer':
+      return <ChartViewerView />
     case 'ingest':
       return <IngestView />
     case 'pipeline':

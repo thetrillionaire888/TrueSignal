@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 
-export type ViewId = 'overview' | 'channels' | 'signals' | 'analytics' | 'ingest' | 'pipeline' | 'data-manager'
+export type ViewId = 'overview' | 'channels' | 'signals' | 'analytics' | 'chart-viewer' | 'ingest' | 'pipeline' | 'data-manager'
 
 type SignalFilters = {
   channelId: string | null
