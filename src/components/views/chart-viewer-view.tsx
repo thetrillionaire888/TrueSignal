@@ -353,7 +353,7 @@ function SignalChart({ detail: data }: { detail: SignalDetail }) {
     })
     vLineSeries.setData([
       { time: postedTime, value: chartMin },
-      { time: postedTime, value: chartMax },
+      { time: (postedTime + 1) as Time, value: chartMax }, // +1s to satisfy ascending requirement
     ])
 
     // Price lines
