@@ -1,8 +1,5 @@
 [telegram-collector] Installing dependencies...
 bun install v1.3.14 (0d9b296a)
-Resolving dependencies
-Resolved, downloaded and extracted [2]
-Saved lockfile
 
 + backtest-kit@15.2.0
 + drizzle-orm@0.45.2
@@ -10,7 +7,7 @@ Saved lockfile
 + socket.io@4.8.3
 + teleproto@1.227.4
 
-69 packages installed [930.00ms]
+69 packages installed [775.00ms]
 [telegram-collector] Running bun run dev...
 $ bun index.ts
 10 | 
