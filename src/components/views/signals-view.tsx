@@ -309,6 +309,8 @@ export function SignalsView() {
                 <SelectItem value="win">Win</SelectItem>
                 <SelectItem value="loss">Loss</SelectItem>
                 <SelectItem value="breakeven">Breakeven</SelectItem>
+                <SelectItem value="invalid">Invalid</SelectItem>
+                <SelectItem value="no_data">No data</SelectItem>
               </SelectContent>
             </Select>
           </div>
