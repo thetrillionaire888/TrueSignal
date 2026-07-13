@@ -28,6 +28,8 @@ import {
   RefreshCw,
   Loader2,
   AlertCircle,
+  Copy,
+  Check,
 } from 'lucide-react'
 
 type Detail = {
@@ -173,9 +175,12 @@ export function SignalDetailDrawer() {
               tag={`#${data.message.telegramMessageId} · ${data.message.ingestSource}`}
               tone="slate"
             >
-              <pre className="whitespace-pre-wrap break-words rounded-lg bg-muted/50 p-3 font-mono text-xs leading-relaxed text-foreground/90">
-                {data.message.rawText}
-              </pre>
+              <div className="group/raw relative">
+                <pre className="whitespace-pre-wrap break-words rounded-lg bg-muted/50 p-3 pr-10 font-mono text-xs leading-relaxed text-foreground/90">
+                  {data.message.rawText}
+                </pre>
+                <CopyButton text={data.message.rawText} />
+              </div>
               <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
                 <span className="flex items-center gap-1">
                   <Clock className="h-3 w-3" /> {fmtDateTime(data.message.postedAt)}
@@ -361,6 +366,41 @@ export function SignalDetailDrawer() {
         )}
       </SheetContent>
     </Sheet>
+  )
+}
+
+// Copy-to-clipboard button — shows Copy icon, switches to Check on success
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = React.useState(false)
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // Fallback for older browsers
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }
+  return (
+    <button
+      onClick={handleCopy}
+      className="absolute right-2 top-2 rounded-md border border-border/50 bg-card/80 p-1.5 text-muted-foreground opacity-0 backdrop-blur transition-all hover:bg-card hover:text-foreground group-hover/raw:opacity-100"
+      title={copied ? 'Copied!' : 'Copy raw message'}
+    >
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-emerald-500" />
+      ) : (
+        <Copy className="h-3.5 w-3.5" />
+      )}
+    </button>
   )
 }
 
