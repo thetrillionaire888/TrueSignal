@@ -9,8 +9,9 @@ import { MonthlyHeatmap, type MonthCell } from '@/components/charts/monthly-heat
 import { MfeMaeScatter, type MfeMaePoint } from '@/components/charts/mfe-mae-scatter'
 import { useUI } from '@/lib/store'
 import { fmtPct, fmtR, fmtInt } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Target, Scale, Activity, Gauge, ArrowDownRight, TrendingUp, Zap, Flame, Percent } from 'lucide-react'
+import { Target, Scale, Activity, Gauge, ArrowDownRight, TrendingUp, Zap, Flame, Percent, CheckCircle2 } from 'lucide-react'
 
 type Analytics = {
   metrics: {
@@ -32,6 +33,7 @@ type Analytics = {
     avgDurationMinutes: number
     closedSignals: number
   }
+  totalParsedSignals: number
   distribution: DistBucket[]
   monthly: MonthCell[]
   instruments: Array<{ instrument: string; instrumentType: string; trades: number; winRate: number; totalR: number; avgR: number }>
@@ -111,6 +113,38 @@ export function AnalyticsView() {
         <KpiCard label="Calmar" value={m.calmar.toFixed(2)} sub="ann. R / max DD" icon={Activity} tone="muted" />
         <KpiCard label="Max DD" value={`-${m.maxDrawdown.toFixed(2)}R`} icon={ArrowDownRight} tone="negative" />
       </div>
+
+      {/* Validation coverage bar */}
+      {data.totalParsedSignals > 0 && (
+        <div className="flex items-center gap-4 rounded-xl border border-border/50 bg-muted/20 px-4 py-3">
+          <CheckCircle2 className={cn(
+            'h-5 w-5 shrink-0',
+            m.closedSignals / data.totalParsedSignals >= 0.9 ? 'text-emerald-500' :
+            m.closedSignals / data.totalParsedSignals >= 0.5 ? 'text-amber-500' :
+            'text-rose-500'
+          )} />
+          <div className="flex-1">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-medium text-foreground">Validation Coverage</span>
+              <span className="tnum text-muted-foreground">
+                {fmtInt(m.closedSignals)} / {fmtInt(data.totalParsedSignals)} signals evaluated
+                ({((m.closedSignals / data.totalParsedSignals) * 100).toFixed(1)}%)
+              </span>
+            </div>
+            <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-muted">
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all',
+                  m.closedSignals / data.totalParsedSignals >= 0.9 ? 'bg-emerald-500' :
+                  m.closedSignals / data.totalParsedSignals >= 0.5 ? 'bg-amber-500' :
+                  'bg-rose-500'
+                )}
+                style={{ width: `${Math.min(100, (m.closedSignals / data.totalParsedSignals) * 100)}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Distribution + win/loss stats */}
       <div className="grid gap-5 lg:grid-cols-3">

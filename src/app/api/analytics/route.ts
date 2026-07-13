@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { sqlite } from '@/lib/db'
 import { loadEvalRows } from '@/lib/queries'
 import {
   computeMetrics,
@@ -16,6 +17,11 @@ export async function GET(req: Request) {
 
   let rows = await loadEvalRows()
   if (channelId) rows = rows.filter((r) => r.channelId === channelId)
+
+  // Count total parsed signals (not just evaluated ones) for validation coverage
+  const totalParsed = channelId
+    ? (sqlite.prepare('SELECT COUNT(*) as c FROM Signal WHERE channelId = ?').get(channelId) as { c: number }).c
+    : (sqlite.prepare('SELECT COUNT(*) as c FROM Signal').get() as { c: number }).c
 
   const mapped = rows.map((r) => ({
     rMultiple: r.rMultiple,
@@ -84,6 +90,7 @@ export async function GET(req: Request) {
 
   return NextResponse.json({
     metrics,
+    totalParsedSignals: totalParsed,
     distribution,
     monthly,
     instruments,
